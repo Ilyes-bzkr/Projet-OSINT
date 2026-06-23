@@ -7,12 +7,20 @@ import asyncio
 import json
 import uuid
 from datetime import datetime
+from typing import Callable
+
 from fastapi import WebSocket, WebSocketDisconnect
-from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.core.database import AsyncSessionLocal, SearchRecord, ResultRecord, init_db
 from app.core.logger import logger
-from app.models.result import WebSocketMessage, ModuleProgress, ModuleType
+from app.models.result import ModuleType, OsintResult, ResultCategory, WebSocketMessage
 from app.models.search import SearchRequest
+from app.modules.breach_checker import check_breaches
+from app.modules.github_search import search_github
+from app.modules.name_engine import generate_search_profile
+from app.modules.paste_search import search_pastes
+from app.modules.social_checker import check_all_platforms
+from app.modules.web_search import run_all_dorks
 
 
 async def send_message(websocket: WebSocket, msg: WebSocketMessage):
@@ -62,54 +70,123 @@ async def send_error(websocket: WebSocket, search_id: str, module: str, error: s
     ))
 
 
-async def run_search(websocket: WebSocket, request: SearchRequest, search_id: str):
+async def _save_result_to_db(result: OsintResult):
+    """Sauvegarde un résultat OSINT dans la table results."""
+    try:
+        async with AsyncSessionLocal() as session:
+            record = ResultRecord(
+                id=result.id,
+                search_id=result.search_id,
+                module=result.module.value,
+                category=result.category.value,
+                title=result.title,
+                url=result.url,
+                snippet=result.snippet,
+                raw_data=json.dumps(result.raw_data) if result.raw_data else None,
+                relevance_score=result.relevance_score,
+                is_sensitive=result.is_sensitive,
+                found_at=result.found_at,
+            )
+            session.add(record)
+            await session.commit()
+    except Exception as e:
+        logger.warning(f"Erreur sauvegarde résultat en DB : {e}")
+
+
+async def _handle_result(websocket: WebSocket, search_id: str, module_name: str, result: OsintResult):
+    """Envoie le résultat au frontend puis le persiste en base."""
+    await send_result(websocket, search_id, module_name, result.model_dump(mode="json"))
+    await _save_result_to_db(result)
+
+
+async def _safe_run_module(coro, module_name: str):
+    """Exécute un module en isolant ses erreurs des autres modules."""
+    try:
+        return await coro
+    except Exception as e:
+        logger.error(f"Erreur module {module_name} : {e}")
+        return []
+
+
+def _collect_emails(results: list[OsintResult]) -> set[str]:
+    """Extrait les emails trouvés dans les résultats d'un module."""
+    emails = set()
+    for result in results:
+        if result.raw_data and result.raw_data.get("email"):
+            emails.add(result.raw_data["email"])
+    return emails
+
+
+async def run_search(websocket: WebSocket, request: SearchRequest, search_id: str) -> int:
     """
-    Orchestre tous les modules OSINT en parallèle.
-    Streame chaque résultat dès qu'il est trouvé.
-    TODO Phase 2+ : brancher les vrais modules ici.
+    Orchestre tous les modules OSINT et streame les résultats en temps réel.
+    Retourne le nombre total de résultats trouvés.
     """
-    from app.core.config import settings
-
-    # Modules à exécuter (sera enrichi Phase 2+)
-    modules = [
-        ModuleType.NAME_ENGINE,
-        ModuleType.WEB_SEARCH,
-        ModuleType.GITHUB,
-        ModuleType.SOCIAL,
-        ModuleType.BREACH,
-        ModuleType.PASTE,
-    ]
-
-    if settings.enable_data_brokers:
-        modules.append(ModuleType.DATA_BROKERS)
-
     total_results = 0
+    pending_tasks: list[asyncio.Task] = []
+    emails_collected: set[str] = set()
 
-    # Annonce le démarrage de chaque module
-    for module in modules:
-        await send_progress(
-            websocket, search_id, module.value,
-            "pending", f"En attente...", 0
-        )
+    def make_callback(module_name: str) -> Callable:
+        def callback(result: OsintResult):
+            nonlocal total_results
+            total_results += 1
+            if result.category == ResultCategory.CONTACT and result.raw_data:
+                email = result.raw_data.get("email")
+                if email:
+                    emails_collected.add(email)
+            task = asyncio.create_task(_handle_result(websocket, search_id, module_name, result))
+            pending_tasks.append(task)
+        return callback
 
-    await asyncio.sleep(0.1)
+    # === Module 1 : name_engine (synchrone, pas de callback) ===
+    await send_progress(websocket, search_id, "name_engine", "running", "Génération du profil de recherche...", 0)
+    try:
+        profile = generate_search_profile(request.name)
+        await send_progress(websocket, search_id, "name_engine", "completed", "Profil généré", 100)
+    except Exception as e:
+        logger.error(f"Erreur name_engine : {e}")
+        await send_error(websocket, search_id, "name_engine", str(e))
+        await send_message(websocket, WebSocketMessage(
+            type="complete", search_id=search_id, message="Recherche terminée",
+            data={"total_results": 0, "risk_score": None}
+        ))
+        return 0
 
-    # === PHASE 2 : les modules seront branchés ici ===
-    # Pour l'instant : simulation pour valider le pipeline WebSocket
+    # === Modules 2 : web_search, github_search, social_checker en parallèle ===
+    for module_name in ("web_search", "github", "social"):
+        await send_progress(websocket, search_id, module_name, "running", f"Module {module_name} en cours...", 10)
 
-    for i, module in enumerate(modules):
-        await send_progress(
-            websocket, search_id, module.value,
-            "running", f"Module {module.value} en cours...",
-            int((i / len(modules)) * 100)
-        )
-        await asyncio.sleep(0.2)  # Retiré en Phase 2
+    web_results, github_results, social_results = await asyncio.gather(
+        _safe_run_module(run_all_dorks(profile, search_id, make_callback("web_search")), "web_search"),
+        _safe_run_module(search_github(profile, search_id, make_callback("github")), "github"),
+        _safe_run_module(check_all_platforms(profile, search_id, make_callback("social")), "social"),
+    )
 
-        await send_progress(
-            websocket, search_id, module.value,
-            "completed", f"Module {module.value} terminé",
-            100
-        )
+    for module_name in ("web_search", "github", "social"):
+        await send_progress(websocket, search_id, module_name, "completed", f"Module {module_name} terminé", 100)
+
+    emails_collected |= _collect_emails(web_results) | _collect_emails(github_results)
+
+    # === Module 5+6 : breach_checker (a besoin des emails) et paste_search en parallèle ===
+    for module_name in ("breach", "paste"):
+        await send_progress(websocket, search_id, module_name, "running", f"Module {module_name} en cours...", 10)
+
+    breach_results, paste_results = await asyncio.gather(
+        _safe_run_module(
+            check_breaches(
+                list(emails_collected), profile.username_variants, search_id, make_callback("breach")
+            ),
+            "breach",
+        ),
+        _safe_run_module(search_pastes(profile, search_id, make_callback("paste")), "paste"),
+    )
+
+    for module_name in ("breach", "paste"):
+        await send_progress(websocket, search_id, module_name, "completed", f"Module {module_name} terminé", 100)
+
+    # Attendre l'envoi et la sauvegarde de tous les résultats en attente
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks)
 
     # Annonce la fin
     await send_message(websocket, WebSocketMessage(
@@ -121,6 +198,8 @@ async def run_search(websocket: WebSocket, request: SearchRequest, search_id: st
             "risk_score": None
         }
     ))
+
+    return total_results
 
 
 async def handle_search_websocket(websocket: WebSocket):
@@ -161,7 +240,7 @@ async def handle_search_websocket(websocket: WebSocket):
         ))
 
         # Lancer la recherche
-        await run_search(websocket, request, search_id)
+        total_results = await run_search(websocket, request, search_id)
 
         # Marquer comme terminé en DB
         async with AsyncSessionLocal() as session:
@@ -169,6 +248,7 @@ async def handle_search_websocket(websocket: WebSocket):
             if result:
                 result.status = "completed"
                 result.completed_at = datetime.utcnow()
+                result.total_results = total_results
                 await session.commit()
 
     except WebSocketDisconnect:
