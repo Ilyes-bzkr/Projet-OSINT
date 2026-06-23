@@ -1,37 +1,108 @@
 <!DOCTYPE html>
 <html lang="fr">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OSINT Eagle</title>
-    <style>
-        body {
-            margin: 0;
-            background: #0a0b0f;
-            color: #e0e0e0;
-            font-family: 'Courier New', monospace;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            height: 100vh;
-            flex-direction: column;
-            gap: 16px;
-        }
-        h1 { color: #00d4ff; font-size: 2rem; margin: 0; }
-        p { color: #888; margin: 0; }
-        .badge {
-            background: #1a1f2e;
-            border: 1px solid #00d4ff33;
-            color: #00d4ff;
-            padding: 4px 12px;
-            border-radius: 4px;
-            font-size: 0.8rem;
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OSINT Eagle</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <h1>🦅 OSINT Eagle</h1>
-    <p>Phase 0 — Serveur opérationnel</p>
-    <span class="badge">Frontend — Phase 3</span>
+<div class="scanlines"></div>
+<div id="toast-container" class="toast-container"></div>
+
+<!-- ÉCRAN 1 — ACCUEIL -->
+<section id="screen-home" class="screen active">
+  <div class="bg-grid"></div>
+  <div class="home-content">
+    <h1 class="logo glow stagger" style="--delay:0">🦅 OSINT EAGLE</h1>
+    <p class="tagline stagger" style="--delay:1">Découvrez votre empreinte numérique</p>
+    <div class="search-bar stagger" style="--delay:2">
+      <input id="search-input" type="text" placeholder="Entrez votre nom complet..." maxlength="100" autocomplete="off">
+      <button id="search-btn">LANCER LA RECHERCHE</button>
+    </div>
+    <p class="disclaimer stagger" style="--delay:3">Usage personnel uniquement • Données publiques</p>
+  </div>
+</section>
+
+<!-- ÉCRAN 2 — PROGRESSION -->
+<section id="screen-searching" class="screen">
+  <header class="mini-header"><span class="logo-small">🦅 OSINT EAGLE</span></header>
+  <div class="searching-content">
+    <h2 id="searched-name" class="searched-name"></h2>
+    <p id="rotating-text" class="rotating-text"></p>
+
+    <div class="modules-grid" id="modules-grid"></div>
+
+    <div class="progress-bar-wrap">
+      <div class="progress-bar"><div id="progress-fill" class="progress-fill"></div></div>
+      <span id="progress-percent" class="progress-percent">0%</span>
+    </div>
+    <p id="total-counter" class="total-counter">0 résultats trouvés</p>
+  </div>
+</section>
+
+<!-- ÉCRAN 3 — RÉSULTATS -->
+<section id="screen-results" class="screen">
+  <header class="results-header">
+    <span class="logo-small">🦅 OSINT EAGLE</span>
+    <span id="results-name" class="results-name"></span>
+    <span id="risk-badge" class="risk-badge">RISQUE : --/100</span>
+    <div class="header-actions">
+      <button id="details-btn" class="btn-outline">PLUS DE DÉTAILS</button>
+      <button id="new-search-btn" class="btn-outline">NOUVELLE RECHERCHE</button>
+    </div>
+  </header>
+
+  <div class="results-body">
+    <aside class="results-left">
+      <h3 class="col-title">MÉDIAS &amp; DOCUMENTS</h3>
+
+      <section class="media-section">
+        <h4>Photos</h4>
+        <div id="photos-grid" class="photos-grid"></div>
+      </section>
+
+      <section class="media-section">
+        <h4>Documents</h4>
+        <ul id="documents-list" class="documents-list"></ul>
+      </section>
+
+      <section class="media-section">
+        <h4>Vidéos</h4>
+        <ul id="videos-list" class="videos-list"></ul>
+      </section>
+
+      <section class="media-section">
+        <h4>Comptes trouvés</h4>
+        <div id="accounts-list" class="accounts-list"></div>
+      </section>
+    </aside>
+
+    <main class="results-right">
+      <h3 class="col-title">PROFIL COMPLET — ANALYSE IA</h3>
+      <div id="ai-placeholder" class="ai-placeholder">
+        ⏳ Analyse IA en cours de génération...<br>
+        La fiche d'identité complète sera disponible après configuration de l'API Claude (Phase 4)
+      </div>
+      <div id="ai-report" class="ai-report" hidden></div>
+    </main>
+  </div>
+</section>
+
+<!-- PANNEAU DÉTAILS -->
+<div id="details-overlay" class="details-overlay"></div>
+<aside id="details-panel" class="details-panel">
+  <header class="details-panel-header">
+    <span>DONNÉES BRUTES</span>
+    <span id="details-count" class="details-count"></span>
+    <button id="details-close" class="details-close">✕</button>
+  </header>
+  <div class="details-panel-body" id="details-panel-body"></div>
+</aside>
+
+<script src="/static/app.js"></script>
 </body>
 </html>

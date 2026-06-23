@@ -7,10 +7,14 @@ import asyncio
 import json
 import uuid
 from datetime import datetime
-from typing import Callable
+from typing import Callable, Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from app.ai.analyzer import filter_results
+from app.ai.profiler import build_profile
+from app.ai.reporter import generate_report_html
+from app.core.config import settings
 from app.core.database import AsyncSessionLocal, SearchRecord, ResultRecord, init_db
 from app.core.logger import logger
 from app.models.result import ModuleType, OsintResult, ResultCategory, WebSocketMessage
@@ -117,19 +121,21 @@ def _collect_emails(results: list[OsintResult]) -> set[str]:
     return emails
 
 
-async def run_search(websocket: WebSocket, request: SearchRequest, search_id: str) -> int:
+async def run_search(websocket: WebSocket, request: SearchRequest, search_id: str) -> tuple[int, Optional[float]]:
     """
     Orchestre tous les modules OSINT et streame les résultats en temps réel.
-    Retourne le nombre total de résultats trouvés.
+    Retourne (nombre total de résultats trouvés, risk_score IA ou None).
     """
     total_results = 0
     pending_tasks: list[asyncio.Task] = []
     emails_collected: set[str] = set()
+    all_results: list[OsintResult] = []
 
     def make_callback(module_name: str) -> Callable:
         def callback(result: OsintResult):
             nonlocal total_results
             total_results += 1
+            all_results.append(result)
             if result.category == ResultCategory.CONTACT and result.raw_data:
                 email = result.raw_data.get("email")
                 if email:
@@ -150,7 +156,7 @@ async def run_search(websocket: WebSocket, request: SearchRequest, search_id: st
             type="complete", search_id=search_id, message="Recherche terminée",
             data={"total_results": 0, "risk_score": None}
         ))
-        return 0
+        return 0, None
 
     # === Modules 2 : web_search, github_search, social_checker en parallèle ===
     for module_name in ("web_search", "github", "social"):
@@ -188,6 +194,9 @@ async def run_search(websocket: WebSocket, request: SearchRequest, search_id: st
     if pending_tasks:
         await asyncio.gather(*pending_tasks)
 
+    # === Module 7 : analyse IA (filtrage + profil + rapport) ===
+    ai_risk_score = await _run_ai_pipeline(websocket, search_id, profile, request, all_results)
+
     # Annonce la fin
     await send_message(websocket, WebSocketMessage(
         type="complete",
@@ -195,11 +204,78 @@ async def run_search(websocket: WebSocket, request: SearchRequest, search_id: st
         message="Recherche terminée",
         data={
             "total_results": total_results,
-            "risk_score": None
+            "risk_score": ai_risk_score
         }
     ))
 
-    return total_results
+    return total_results, ai_risk_score
+
+
+async def _run_ai_pipeline(
+    websocket: WebSocket,
+    search_id: str,
+    profile,
+    request: SearchRequest,
+    all_results: list[OsintResult],
+) -> Optional[float]:
+    """Filtre les résultats, construit le profil IA et génère le rapport HTML."""
+    if not request.enable_ai:
+        await send_progress(websocket, search_id, "ai_analysis", "completed", "Analyse IA désactivée", 100)
+        return None
+
+    if not settings.anthropic_api_key:
+        logger.warning("[AI] ANTHROPIC_API_KEY absente, analyse IA ignorée")
+        await send_progress(
+            websocket, search_id, "ai_analysis", "failed",
+            "Configurez ANTHROPIC_API_KEY pour l'analyse IA", 100
+        )
+        return None
+
+    await send_progress(
+        websocket, search_id, "ai_analysis", "running",
+        "Filtrage des résultats par intelligence artificielle...", 10
+    )
+
+    try:
+        async def ai_progress_callback(message: str):
+            await send_progress(websocket, search_id, "ai_analysis", "running", message, 50)
+
+        filtered = await filter_results(all_results, profile, search_id, ai_progress_callback)
+
+        await send_progress(websocket, search_id, "ai_analysis", "running", "Construction du profil de renseignement...", 70)
+        ai_profile_data = await build_profile(filtered, profile, search_id)
+
+        await send_progress(websocket, search_id, "ai_analysis", "running", "Génération du rapport final...", 90)
+        ai_html = await generate_report_html(ai_profile_data, profile)
+
+        ai_risk_score = None
+        privacy = ai_profile_data.get("privacy_score") if isinstance(ai_profile_data, dict) else None
+        if privacy and isinstance(privacy.get("score"), (int, float)):
+            ai_risk_score = float(privacy["score"])
+
+        total_count = len(all_results)
+        filtered_count = len(filtered)
+        filter_rate = f"{round((1 - filtered_count / total_count) * 100)}%" if total_count else "0%"
+
+        await send_message(websocket, WebSocketMessage(
+            type="ai_profile",
+            search_id=search_id,
+            data={
+                "html": ai_html,
+                "profile": ai_profile_data,
+                "risk_score": ai_risk_score,
+                "filtered_count": filtered_count,
+                "total_count": total_count,
+                "filter_rate": filter_rate,
+            }
+        ))
+
+        await send_progress(websocket, search_id, "ai_analysis", "completed", "Analyse IA terminée", 100)
+        return ai_risk_score
+    except Exception as e:
+        logger.error(f"Erreur pipeline IA : {e}")
+        await send_progress(websocket, search_id, "ai_analysis", "failed", "Erreur lors de l'analyse IA", 100)
+        return None
 
 
 async def handle_search_websocket(websocket: WebSocket):
@@ -240,7 +316,7 @@ async def handle_search_websocket(websocket: WebSocket):
         ))
 
         # Lancer la recherche
-        total_results = await run_search(websocket, request, search_id)
+        total_results, risk_score = await run_search(websocket, request, search_id)
 
         # Marquer comme terminé en DB
         async with AsyncSessionLocal() as session:
@@ -249,6 +325,7 @@ async def handle_search_websocket(websocket: WebSocket):
                 result.status = "completed"
                 result.completed_at = datetime.utcnow()
                 result.total_results = total_results
+                result.risk_score = risk_score
                 await session.commit()
 
     except WebSocketDisconnect:

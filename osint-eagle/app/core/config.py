@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = Field(default="", env="ANTHROPIC_API_KEY")
     hibp_api_key: str = Field(default="", env="HIBP_API_KEY")
     github_token: str = Field(default="", env="GITHUB_TOKEN")
+    rapidapi_key: str = Field(default="", env="RAPIDAPI_KEY")
 
     # App
     app_host: str = Field(default="127.0.0.1", env="APP_HOST")
