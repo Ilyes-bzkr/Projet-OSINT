@@ -1,19 +1,32 @@
 """
-OSINT Eagle — Point d'entrée principal
-Démarre le serveur FastAPI avec Uvicorn.
+OSINT Eagle — Point d'entrée principal.
 """
 
 import uvicorn
-from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
+from app.core.database import init_db
+from app.core.logger import logger
+from app.api.routes import router
+from app.api.websocket import handle_search_websocket
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    logger.info("OSINT Eagle démarré ✓")
+    yield
+
 
 app = FastAPI(
     title="OSINT Eagle",
     description="Personal OSINT & Data Intelligence Tool",
-    version="0.1.0"
+    version="0.1.0",
+    lifespan=lifespan
 )
 
 app.add_middleware(
@@ -24,17 +37,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve static files
+# Routes HTTP
+app.include_router(router)
+
+# WebSocket
+@app.websocket("/ws/search")
+async def search_websocket(websocket: WebSocket):
+    await handle_search_websocket(websocket)
+
+# Static files
 static_path = Path(__file__).parent / "app" / "static"
 app.mount("/static", StaticFiles(directory=str(static_path)), name="static")
 
 @app.get("/")
 async def serve_frontend():
     return FileResponse(str(static_path / "index.html"))
-
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "app": "OSINT Eagle", "version": "0.1.0"}
 
 if __name__ == "__main__":
     uvicorn.run(
