@@ -41,12 +41,47 @@ _MAX_RESULTS_PER_DORK = 5
 _MAX_CONCURRENT_DORKS = 2
 _RATE_LIMIT_DELAY = 2.0
 
-# Dorks prioritaires (identité, LinkedIn, GitHub, email, PDF) : exécutés en
-# premier. S'ils ne ramènent presque rien, l'empreinte web est faible et les
-# dorks secondaires (souvent à 0 résultat) sont coûteux pour rien (3
-# tentatives x 30s chacun) : on les saute.
-_PRIORITY_DORK_KEYS = {("identity", 0), ("contact", 0), ("professional", 0), ("technical", 0), ("documents", 0)}
+# Dorks toujours prioritaires (identité, email, PDF) : exécutés en premier
+# quoi qu'il arrive. S'ils ne ramènent presque rien, l'empreinte web est
+# faible et les dorks secondaires (souvent à 0 résultat) sont coûteux pour
+# rien (3 tentatives x 30s chacun) : on les saute.
+_FIXED_PRIORITY_DORK_KEYS = {("identity", 0), ("contact", 0), ("documents", 0)}
+
+# Dorks "site:plateforme" : prioritaires uniquement si social_checker a
+# confirmé un compte sur cette plateforme en amont (cf. confirmed_platforms).
+# Sans confirmation disponible (None/vide), on retombe sur github+linkedin
+# en dur pour ne pas changer le comportement par défaut.
+_PLATFORM_DORK_KEYS = {
+    "github.com": ("technical", 0),
+    "linkedin.com": ("professional", 0),
+    "instagram.com": ("social", 1),
+    "twitter.com": ("social", 0),
+    "x.com": ("social", 0),
+    "facebook.com": ("social", 2),
+}
+_DEFAULT_PLATFORM_DOMAINS = ("github.com", "linkedin.com")
+
 _MIN_PRIORITY_RESULTS = 3
+
+
+def _resolve_priority_keys(confirmed_platforms: list[str] | None) -> set[tuple[str, int]]:
+    """Combine les dorks fixes avec les dorks plateforme confirmés par social_checker."""
+    keys = set(_FIXED_PRIORITY_DORK_KEYS)
+
+    if not confirmed_platforms:
+        domains = _DEFAULT_PLATFORM_DOMAINS
+        logger.info("web_search : confirmed_platforms vide/absent, dorks plateformes par défaut = github+linkedin")
+    else:
+        domains = {p.lower() for p in confirmed_platforms}
+        logger.info(f"web_search : plateformes confirmées reçues = {sorted(domains)}")
+
+    for domain in domains:
+        key = _PLATFORM_DORK_KEYS.get(domain)
+        if key:
+            keys.add(key)
+
+    logger.info(f"web_search : dorks prioritaires résolus = {sorted(keys)}")
+    return keys
 
 _BING_URL = "https://www.bing.com/search"
 _MAX_ATTEMPTS = 3
@@ -192,11 +227,14 @@ async def run_all_dorks(
     callback: Callable,
     priority_only: bool = False,
     city_override: str | None = None,
+    confirmed_platforms: list[str] | None = None,
 ) -> list[OsintResult]:
     """Exécute tous les dorks générés par name_engine via scraping Bing (Playwright)."""
     semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DORKS)
     seen_urls: set = set()
     results: list[OsintResult] = []
+
+    priority_keys = _resolve_priority_keys(confirmed_platforms)
 
     def _apply_city(query: str) -> str:
         return f'{query} "{city_override}"' if city_override else query
@@ -205,7 +243,7 @@ async def run_all_dorks(
     secondary_specs: list[tuple[str, str]] = []
     for category_key, queries in profile.search_queries.items():
         for idx, query in enumerate(queries):
-            target = priority_specs if (category_key, idx) in _PRIORITY_DORK_KEYS else secondary_specs
+            target = priority_specs if (category_key, idx) in priority_keys else secondary_specs
             target.append((category_key, _apply_city(query)))
 
     async with async_playwright() as p:
