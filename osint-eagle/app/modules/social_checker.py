@@ -88,17 +88,30 @@ async def _check_platform_username(
             logger.warning(f"social_checker : erreur callback : {e}")
 
 
-async def check_all_platforms(profile: NameProfile, search_id: str, callback: Callable) -> list[OsintResult]:
+async def check_all_platforms(
+    profile: NameProfile,
+    search_id: str,
+    callback: Callable,
+    max_variants: int | None = None,
+    username_override: str | None = None,
+) -> list[OsintResult]:
     """Vérifie l'existence de comptes sur les plateformes listées dans platforms.json."""
     platforms = _load_platforms()
     semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
     results: list[OsintResult] = []
 
+    if username_override:
+        usernames = [username_override]
+    elif max_variants is not None:
+        usernames = profile.username_variants[:max_variants]
+    else:
+        usernames = profile.username_variants
+
     async with httpx.AsyncClient(headers=_HEADERS, follow_redirects=True) as client:
         tasks = [
             _check_platform_username(client, semaphore, platform, username, search_id, callback, results)
             for platform in platforms
-            for username in profile.username_variants
+            for username in usernames
         ]
         logger.info(f"social_checker : vérification de {len(tasks)} combinaisons plateforme/username")
         await asyncio.gather(*tasks)
