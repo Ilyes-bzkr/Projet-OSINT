@@ -4,6 +4,7 @@ Agrégation cross-sources en profil structuré via Claude.
 """
 
 import json
+import urllib.parse
 
 from anthropic import AsyncAnthropic
 
@@ -15,8 +16,8 @@ from app.models.search import NameProfile
 _MODEL = "claude-sonnet-4-6"
 _MAX_TOKENS = 4000
 _TIMEOUT = 60.0
-_MAX_RESULTS = 100
-_SNIPPET_MAX_LEN = 300
+_MAX_RESULTS = 50
+_SNIPPET_MAX_LEN = 150
 
 _SYSTEM_PROMPT = (
     "Tu es un analyste de renseignement expert en OSINT. "
@@ -25,7 +26,9 @@ _SYSTEM_PROMPT = (
     "Sois exhaustif, précis, et factuellement rigoureux. "
     "Ne jamais inventer d'informations non présentes dans "
     "les données. Si une information est incertaine, le mentionner. "
-    "Réponds UNIQUEMENT en JSON valide."
+    "Réponds UNIQUEMENT avec du JSON pur, sans markdown, "
+    "sans backticks, sans texte avant ou après. "
+    "Le JSON doit commencer par { et finir par }"
 )
 
 _PROFILE_SCHEMA = """{
@@ -113,13 +116,19 @@ _PROFILE_SCHEMA = """{
 }"""
 
 
+def _domain_of(url: str | None) -> str:
+    if not url:
+        return ""
+    return urllib.parse.urlparse(url).netloc
+
+
 def _result_to_payload(result: OsintResult) -> dict:
     snippet = result.snippet or ""
     if len(snippet) > _SNIPPET_MAX_LEN:
         snippet = snippet[:_SNIPPET_MAX_LEN]
     return {
         "title": result.title,
-        "url": result.url,
+        "domain": _domain_of(result.url),
         "snippet": snippet,
         "module": result.module.value,
     }
@@ -238,15 +247,19 @@ async def build_profile(
                 messages=[{
                     "role": "user",
                     "content": _build_user_prompt(profile, selected) if attempt == 0 else
-                    f"Réponds UNIQUEMENT avec un JSON valide respectant la structure demandée pour : {profile.full_name}. "
-                    f"Données : {json.dumps(_group_by_module(selected), ensure_ascii=False)[:8000]}",
+                    f"Réponds UNIQUEMENT avec un JSON valide pour : {profile.full_name}.\n"
+                    f"Structure exacte requise (respecte chaque clé) :\n{_PROFILE_SCHEMA}\n\n"
+                    f"Données disponibles : {json.dumps(_group_by_module(selected), ensure_ascii=False)[:6000]}",
                 }],
             )
             raw_text = response.content[0].text if response.content else ""
             cleaned = _clean_json_text(raw_text)
             return json.loads(cleaned)
         except json.JSONDecodeError:
-            logger.warning(f"[AI] JSON malformé du profil (tentative {attempt + 1}/2)")
+            logger.warning(
+                f"[AI] JSON malformé du profil (tentative {attempt + 1}/2), "
+                f"raw_response[:100]={raw_text[:100]!r}"
+            )
             continue
         except Exception as e:
             logger.error(f"[AI] Erreur appel Claude profiler : {e}")
