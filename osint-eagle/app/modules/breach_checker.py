@@ -33,13 +33,18 @@ async def check_breaches(
 
     seen_sources: set[str] = set()
 
+    api_key = os.getenv("RAPIDAPI_KEY", "")
+    if not api_key and emails:
+        logger.warning("breach_checker : RAPIDAPI_KEY absente, BreachDirectory ignoré")
+
     async with httpx.AsyncClient(headers=_HEADERS, timeout=_TIMEOUT) as client:
         for email in emails:
             await _check_leakcheck(client, email, "email", search_id, callback, results, seen_sources)
             await asyncio.sleep(_RATE_LIMIT_DELAY)
 
-            await _check_breachdirectory(client, email, search_id, callback, results, seen_sources)
-            await asyncio.sleep(_RATE_LIMIT_DELAY)
+            if api_key:
+                await _check_breachdirectory(client, email, api_key, search_id, callback, results, seen_sources)
+                await asyncio.sleep(_RATE_LIMIT_DELAY)
 
         for username in usernames:
             await _check_leakcheck(client, username, "username", search_id, callback, results, seen_sources)
@@ -115,16 +120,12 @@ async def _check_leakcheck(
 async def _check_breachdirectory(
     client: httpx.AsyncClient,
     email: str,
+    api_key: str,
     search_id: str,
     callback: Callable,
     results: list,
     seen_sources: set,
 ):
-    api_key = os.getenv("RAPIDAPI_KEY", "")
-    if not api_key:
-        logger.warning("breach_checker : RAPIDAPI_KEY absente, BreachDirectory ignoré")
-        return
-
     headers = {
         "X-RapidAPI-Host": "breachdirectory.p.rapidapi.com",
         "X-RapidAPI-Key": api_key,

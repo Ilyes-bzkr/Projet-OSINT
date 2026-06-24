@@ -6,7 +6,7 @@ Filtrage et scoring de pertinence par IA (Claude).
 import json
 from typing import Callable, Optional
 
-from anthropic import AsyncAnthropic
+from anthropic import APITimeoutError, AsyncAnthropic
 
 from app.core.config import settings
 from app.core.logger import logger
@@ -15,8 +15,8 @@ from app.models.search import NameProfile
 
 _MODEL = "claude-sonnet-4-6"
 _MAX_TOKENS = 4000
-_TIMEOUT = 60.0
-_BATCH_SIZE = 50
+_TIMEOUT = 120.0
+_BATCH_SIZE = 30
 _SNIPPET_MAX_LEN = 300
 
 _SYSTEM_PROMPT = (
@@ -135,6 +135,9 @@ async def filter_results(
             )
             raw_text = response.content[0].text if response.content else ""
             scores = _parse_scores_response(raw_text)
+        except APITimeoutError:
+            logger.warning(f"[AI] Timeout Claude (batch {batch_idx}/{total_batches}), batch suivant...")
+            scores = {}
         except Exception as e:
             logger.error(f"[AI] Erreur appel Claude (batch {batch_idx}/{total_batches}) : {e}")
             scores = {}

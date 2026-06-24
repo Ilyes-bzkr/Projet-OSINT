@@ -1,14 +1,21 @@
 """
 web_search — OSINT Eagle
-Recherche web via DuckDuckGo dorks.
+Recherche web via scraping Bing avec navigateur headless (Playwright).
+
+Bing bloque les requêtes HTTP classiques (httpx/requests) en leur servant une
+page vide ou mal localisée : un vrai navigateur est nécessaire pour obtenir le
+HTML réel des résultats. Même avec Playwright, Bing applique une détection
+anti-bot intermittente (page de défi resservie de façon aléatoire) : on
+retente donc plusieurs fois avec une page fraîche avant d'abandonner un dork.
 """
 
 import asyncio
+import random
+import urllib.parse
 from typing import Callable
 
-from duckduckgo_search import DDGS
+from playwright.async_api import Browser, Error as PlaywrightError, async_playwright
 
-from app.core.config import settings
 from app.core.logger import logger
 from app.models.result import ModuleType, OsintResult, ResultCategory, RiskLevel
 from app.models.search import NameProfile
@@ -31,12 +38,82 @@ _CATEGORY_MAP = {
 }
 
 _MAX_RESULTS_PER_DORK = 5
-_MAX_CONCURRENT_DORKS = 5
+_MAX_CONCURRENT_DORKS = 2
+_RATE_LIMIT_DELAY = 2.0
+
+_BING_URL = "https://www.bing.com/search"
+_MAX_ATTEMPTS = 3
+_RETRY_DELAY = 2.5
+_GOTO_TIMEOUT = 20000  # ms
+_RESULT_WAIT_TIMEOUT = 5000  # ms
+_DORK_TIMEOUT = 90  # secondes, couvre toutes les tentatives d'un dork
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+]
 
 
-def _run_dork_sync(query: str, max_results: int) -> list[dict]:
-    with DDGS() as ddgs:
-        return list(ddgs.text(query, max_results=max_results))
+def _random_ua() -> str:
+    return random.choice(_USER_AGENTS)
+
+
+def _build_bing_url(query: str, count: int) -> str:
+    # setlang/cc forcent le résultat en anglais US : sans ça, Bing localise
+    # parfois la recherche selon la géolocalisation IP et renvoie des
+    # résultats hors-sujet.
+    params = {"q": query, "count": count, "setlang": "en-US", "cc": "US"}
+    return f"{_BING_URL}?{urllib.parse.urlencode(params)}"
+
+
+async def _scrape_bing_once(browser: Browser, query: str, max_results: int) -> list[dict]:
+    page = await browser.new_page(user_agent=_random_ua())
+    raw_items: list[dict] = []
+    try:
+        await page.goto(_build_bing_url(query, max_results), timeout=_GOTO_TIMEOUT, wait_until="load")
+        await page.wait_for_timeout(1200)
+        await page.wait_for_selector(".b_algo", timeout=_RESULT_WAIT_TIMEOUT)
+        raw_items = await page.eval_on_selector_all(
+            ".b_algo",
+            """els => els.map(el => {
+                const a = el.querySelector("h2 a");
+                const cap = el.querySelector(".b_caption p") || el.querySelector("p");
+                return {
+                    title: a ? a.innerText : null,
+                    href: a ? a.href : null,
+                    body: cap ? cap.innerText : null,
+                };
+            })""",
+        )
+    except PlaywrightError:
+        raw_items = []
+    finally:
+        await page.close()
+
+    return [it for it in raw_items if it.get("title") and it.get("href")][:max_results]
+
+
+async def _scrape_bing(browser: Browser, query: str, max_results: int) -> list[dict]:
+    """Scrape Bing via navigateur headless, avec plusieurs tentatives (anti-bot intermittent)."""
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        items = await _scrape_bing_once(browser, query, max_results)
+        if items:
+            return items
+        if attempt < _MAX_ATTEMPTS:
+            logger.warning(
+                f"web_search : tentative {attempt}/{_MAX_ATTEMPTS} sans résultat pour '{query}', nouvel essai..."
+            )
+            await asyncio.sleep(_RETRY_DELAY)
+
+    logger.warning(f"web_search : aucun résultat Bing après {_MAX_ATTEMPTS} tentatives pour '{query}'")
+    return []
 
 
 def _evaluate_risk(category: ResultCategory, snippet: str) -> tuple[RiskLevel, bool]:
@@ -50,7 +127,7 @@ def _evaluate_risk(category: ResultCategory, snippet: str) -> tuple[RiskLevel, b
 
 async def _run_single_dork(
     semaphore: asyncio.Semaphore,
-    loop: asyncio.AbstractEventLoop,
+    browser: Browser,
     category_key: str,
     query: str,
     search_id: str,
@@ -63,8 +140,8 @@ async def _run_single_dork(
     async with semaphore:
         try:
             raw_results = await asyncio.wait_for(
-                loop.run_in_executor(None, _run_dork_sync, query, _MAX_RESULTS_PER_DORK),
-                timeout=10,
+                _scrape_bing(browser, query, _MAX_RESULTS_PER_DORK),
+                timeout=_DORK_TIMEOUT,
             )
         except asyncio.TimeoutError:
             logger.warning(f"web_search : timeout sur le dork '{query}'")
@@ -74,7 +151,7 @@ async def _run_single_dork(
             raw_results = []
 
         for item in raw_results:
-            url = item.get("href") or item.get("url")
+            url = item.get("href")
             if not url or url in seen_urls:
                 continue
             seen_urls.add(url)
@@ -99,26 +176,31 @@ async def _run_single_dork(
             except Exception as e:
                 logger.warning(f"web_search : erreur callback : {e}")
 
-        await asyncio.sleep(settings.rate_limit_delay)
+        await asyncio.sleep(_RATE_LIMIT_DELAY)
 
 
 async def run_all_dorks(profile: NameProfile, search_id: str, callback: Callable) -> list[OsintResult]:
-    """Exécute tous les dorks générés par name_engine via DuckDuckGo."""
+    """Exécute tous les dorks générés par name_engine via scraping Bing (Playwright)."""
     semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DORKS)
-    loop = asyncio.get_event_loop()
     seen_urls: set = set()
     results: list[OsintResult] = []
 
     tasks = []
-    for category_key, queries in profile.search_queries.items():
-        for query in queries:
-            tasks.append(
-                _run_single_dork(
-                    semaphore, loop, category_key, query, search_id, callback, seen_urls, results
-                )
-            )
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        try:
+            for category_key, queries in profile.search_queries.items():
+                for query in queries:
+                    tasks.append(
+                        _run_single_dork(
+                            semaphore, browser, category_key, query, search_id, callback, seen_urls, results
+                        )
+                    )
 
-    logger.info(f"web_search : exécution de {len(tasks)} dorks pour '{profile.full_name}'")
-    await asyncio.gather(*tasks)
+            logger.info(f"web_search : exécution de {len(tasks)} dorks pour '{profile.full_name}'")
+            await asyncio.gather(*tasks)
+        finally:
+            await browser.close()
+
     logger.info(f"web_search : {len(results)} résultats uniques trouvés")
     return results
