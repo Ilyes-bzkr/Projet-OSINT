@@ -70,6 +70,11 @@ def _build_username_variants(first: str, last: str) -> list[str]:
     else:
         fi = f[0] if f else ""
         li = l[0] if l else ""
+        l_novowel = re.sub(r"[aeiou]", "", l)
+        l4 = l[:4]
+        f3 = f[:3]
+        l_consonants3 = l_novowel[:3]
+
         variants = [
             f"{f}{l}",
             f"{f}.{l}",
@@ -88,13 +93,38 @@ def _build_username_variants(first: str, last: str) -> list[str]:
             f"{f}{l}2024",
         ]
 
+        # Suppression des voyelles du nom de famille (pseudos tronqués type "bzkr")
+        if l_novowel:
+            variants += [f"{f}_{l_novowel}", f"{f}{l_novowel}", f"{f}.{l_novowel}"]
+
+        # Troncature à 4 lettres du nom de famille
+        if l4:
+            variants += [f"{f}_{l4}", f"{f}{l4}"]
+
+        # Prénom tronqué (3 lettres) + nom tronqué (3 consonnes)
+        if f3 and l_consonants3:
+            variants += [f"{f3}_{l_consonants3}", f"{f3}{l_consonants3}"]
+
+        # Initiale + nom tronqué
+        if fi and l_novowel:
+            variants.append(f"{fi}{l_novowel}")
+        if fi and l4:
+            variants.append(f"{fi}{l4}")
+
+        # Prénom complet + chiffres courants (pseudo principal souvent déjà pris)
+        variants += [f"{f}01", f"{f}_01", f"{f}1", f"{f}123", f"{f}_1"]
+
+        # Nom de famille consonantique + prénom
+        if l_novowel:
+            variants += [f"{l_novowel}{f}", f"{l_novowel}_{f}"]
+
     seen = set()
     unique = []
     for v in variants:
         if v and v not in seen:
             seen.add(v)
             unique.append(v)
-    return unique
+    return unique[:50]
 
 
 def _build_search_queries(full_name: str) -> dict[str, list[str]]:
