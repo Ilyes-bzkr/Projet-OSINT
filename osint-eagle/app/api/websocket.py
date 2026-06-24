@@ -28,11 +28,14 @@ from app.modules.web_search import run_all_dorks
 
 
 async def send_message(websocket: WebSocket, msg: WebSocketMessage):
-    """Envoie un message JSON via WebSocket."""
+    """Envoie un message JSON via WebSocket, si la connexion est toujours active."""
+    if not getattr(websocket.state, "is_connected", True):
+        return
     try:
         await websocket.send_text(msg.model_dump_json())
     except Exception as e:
         logger.warning(f"Erreur envoi WebSocket : {e}")
+        websocket.state.is_connected = False
 
 
 async def send_progress(
@@ -284,6 +287,7 @@ async def handle_search_websocket(websocket: WebSocket):
     Reçoit la requête de recherche et lance l'orchestration.
     """
     await websocket.accept()
+    websocket.state.is_connected = True
     logger.info("WebSocket connecté")
 
     try:
@@ -315,8 +319,9 @@ async def handle_search_websocket(websocket: WebSocket):
             data={"name": request.name}
         ))
 
-        # Lancer la recherche
-        total_results, risk_score = await run_search(websocket, request, search_id)
+        # Lancer la recherche (orchestrateur 3 couches)
+        from app.modules.intelligence_engine import run_intelligence_engine
+        total_results, risk_score = await run_intelligence_engine(websocket, request, search_id)
 
         # Marquer comme terminé en DB
         async with AsyncSessionLocal() as session:
@@ -329,6 +334,7 @@ async def handle_search_websocket(websocket: WebSocket):
                 await session.commit()
 
     except WebSocketDisconnect:
+        websocket.state.is_connected = False
         logger.info("WebSocket déconnecté par le client")
     except json.JSONDecodeError:
         await send_message(websocket, WebSocketMessage(
