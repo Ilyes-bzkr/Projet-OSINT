@@ -8,7 +8,7 @@ import unicodedata
 
 from app.models.search import NameProfile
 
-__all__ = ["generate_search_profile"]
+__all__ = ["generate_search_profile", "generate_anchored_dorks"]
 
 _FRENCH_MEDIA = ["lemonde.fr", "lefigaro.fr", "liberation.fr", "ouest-france.fr", "20minutes.fr"]
 
@@ -181,3 +181,48 @@ def generate_search_profile(full_name: str) -> NameProfile:
         username_variants=_build_username_variants(first, last),
         search_queries=_build_search_queries(full_name),
     )
+
+
+def generate_anchored_dorks(
+    first: str,
+    last: str,
+    city: str | None = None,
+    employer: str | None = None,
+) -> list[str]:
+    """Génère des dorks à haute précision combinant le nom et les ancres.
+
+    Beaucoup plus discriminants que le nom seul : en croisant le nom avec la
+    ville et/ou l'employeur/école, on réduit fortement les homonymes.
+
+    Retourne une liste vide si ni ville ni employeur ne sont fournis.
+    """
+    full_name = f"{first} {last}".strip() if last else (first or "").strip()
+    if not full_name:
+        return []
+
+    city = (city or "").strip()
+    employer = (employer or "").strip()
+    quoted = f'"{full_name}"'
+
+    queries: list[str] = []
+
+    if city:
+        queries.append(f'{quoted} "{city}"')
+        queries.append(f'{quoted} "{city}" site:linkedin.com')
+
+    if employer:
+        queries.append(f'{quoted} "{employer}"')
+        queries.append(f'{quoted} "{employer}" site:linkedin.com')
+
+    # Variante la plus discriminante : nom + ville + employeur.
+    if city and employer:
+        queries.append(f'{quoted} "{city}" "{employer}"')
+
+    # Dédupliquer en conservant l'ordre.
+    seen = set()
+    unique = []
+    for q in queries:
+        if q not in seen:
+            seen.add(q)
+            unique.append(q)
+    return unique

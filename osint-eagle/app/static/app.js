@@ -56,6 +56,7 @@ const RISK_WEIGHTS = { low: 1, medium: 3, high: 8, critical: 15 };
 const state = {
   screen: "home",
   searchName: "",
+  anchors: {},
   ws: null,
   manualClose: false,
   reconnectAttempts: 0,
@@ -183,7 +184,7 @@ function connectWebSocket() {
 
   ws.onopen = () => {
     state.reconnectAttempts = 0;
-    ws.send(JSON.stringify({ name: state.searchName }));
+    ws.send(JSON.stringify({ name: state.searchName, anchors: state.anchors || {} }));
   };
 
   ws.onmessage = (event) => {
@@ -516,6 +517,48 @@ function renderDetailsPanel() {
   });
 }
 
+// === Cadrage avant-recherche (ancres) ===
+
+function setupScopingToggle() {
+  const toggle = $("scoping-toggle");
+  const fields = $("scoping-fields");
+  if (!toggle || !fields) return;
+  const icon = toggle.querySelector(".scoping-icon");
+
+  toggle.addEventListener("click", () => {
+    const willOpen = fields.hasAttribute("hidden");
+    if (willOpen) {
+      fields.removeAttribute("hidden");
+      // Forcer un reflow avant d'ajouter la classe pour déclencher la transition.
+      requestAnimationFrame(() => fields.classList.add("open"));
+    } else {
+      fields.classList.remove("open");
+      // Masquer une fois l'animation de repli terminée.
+      setTimeout(() => {
+        if (!fields.classList.contains("open")) fields.setAttribute("hidden", "");
+      }, 400);
+    }
+    toggle.setAttribute("aria-expanded", String(willOpen));
+    if (icon) icon.textContent = willOpen ? "−" : "+";
+  });
+}
+
+function collectAnchors() {
+  const read = (id) => {
+    const el = $(id);
+    if (!el) return null;
+    const value = (el.value || "").trim();
+    return value.length ? value : null;
+  };
+  return {
+    city: read("anchor-city"),
+    employer: read("anchor-employer"),
+    username: read("anchor-username"),
+    email: read("anchor-email"),
+    age_range: read("anchor-age"),
+  };
+}
+
 // === Recherche / reset ===
 
 function startSearch(name) {
@@ -525,6 +568,7 @@ function startSearch(name) {
     return;
   }
   state.searchName = trimmed;
+  state.anchors = collectAnchors();
   state.totalResults = 0;
   state.moduleStatus = {};
   state.moduleCounts = {};
@@ -551,6 +595,7 @@ function newSearch() {
 // === Init ===
 
 document.addEventListener("DOMContentLoaded", () => {
+  setupScopingToggle();
   $("search-btn").addEventListener("click", () => startSearch($("search-input").value));
   $("search-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter") startSearch($("search-input").value);

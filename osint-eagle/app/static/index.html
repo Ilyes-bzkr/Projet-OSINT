@@ -23,7 +23,49 @@
       <input id="search-input" type="text" placeholder="Entrez votre nom complet..." maxlength="100" autocomplete="off">
       <button id="search-btn">LANCER LA RECHERCHE</button>
     </div>
-    <p class="disclaimer stagger" style="--delay:3">Usage personnel uniquement • Données publiques</p>
+
+    <!-- Cadrage avant-recherche (ancres de vérité, toutes optionnelles) -->
+    <div class="scoping stagger" style="--delay:3">
+      <button id="scoping-toggle" class="scoping-toggle" type="button" aria-expanded="false" aria-controls="scoping-fields">
+        <span class="scoping-icon">+</span>
+        <span>Affiner la recherche (optionnel)</span>
+      </button>
+      <div id="scoping-fields" class="scoping-fields" hidden>
+        <p class="scoping-hint">Ces informations améliorent la précision des résultats. Laissez vide ce que vous ignorez.</p>
+        <div class="scoping-grid">
+          <div class="scoping-field">
+            <label for="anchor-city">Ville / région</label>
+            <input id="anchor-city" type="text" placeholder="Ex. Lyon, Île-de-France" maxlength="120" autocomplete="off">
+          </div>
+          <div class="scoping-field">
+            <label for="anchor-employer">Employeur / École</label>
+            <input id="anchor-employer" type="text" placeholder="Ex. Université de…, Acme Corp" maxlength="150" autocomplete="off">
+          </div>
+          <div class="scoping-field">
+            <label for="anchor-username">Pseudo connu</label>
+            <input id="anchor-username" type="text" placeholder="Ex. @pseudo, identifiant" maxlength="100" autocomplete="off">
+          </div>
+          <div class="scoping-field">
+            <label for="anchor-email">Email connu</label>
+            <input id="anchor-email" type="email" placeholder="Ex. prenom.nom@exemple.com" maxlength="150" autocomplete="off">
+          </div>
+          <div class="scoping-field">
+            <label for="anchor-age">Tranche d'âge</label>
+            <select id="anchor-age">
+              <option value="">Non précisé</option>
+              <option value="-18">Moins de 18 ans</option>
+              <option value="18-25">18 – 25 ans</option>
+              <option value="26-35">26 – 35 ans</option>
+              <option value="36-50">36 – 50 ans</option>
+              <option value="51-65">51 – 65 ans</option>
+              <option value="65+">65 ans et plus</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <p class="disclaimer stagger" style="--delay:4">Usage personnel uniquement • Données publiques</p>
   </div>
 </section>
 

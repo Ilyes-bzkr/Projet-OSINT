@@ -11,7 +11,7 @@ from anthropic import APITimeoutError, AsyncAnthropic
 from app.core.config import settings
 from app.core.logger import logger
 from app.models.result import OsintResult, ResultCategory, RiskLevel
-from app.models.search import NameProfile
+from app.models.search import NameProfile, SearchAnchors
 
 _MODEL = "claude-sonnet-4-6"
 _MAX_TOKENS = 4000
@@ -45,12 +45,35 @@ def _result_to_payload(result: OsintResult) -> dict:
     }
 
 
-def _build_user_prompt(profile: NameProfile, contexte_connu: str, batch: list[OsintResult]) -> str:
+def _build_user_prompt(
+    profile: NameProfile,
+    contexte_connu: str,
+    batch: list[OsintResult],
+    anchors_summary: str = "",
+) -> str:
     items = json.dumps([_result_to_payload(r) for r in batch], ensure_ascii=False)
+
+    # Bloc d'ancrage : injecté seulement si l'utilisateur a fourni des ancres.
+    anchors_block = ""
+    if anchors_summary:
+        anchors_block = (
+            f"Ancres de vérité fournies par l'utilisateur : {anchors_summary}\n"
+            "Règles d'ancrage (prioritaires) :\n"
+            "- Un résultat qui CORROBORE une ou plusieurs ancres (même ville, même "
+            "école/employeur, même pseudo, tranche d'âge cohérente) → score élevé (0.85-1.0).\n"
+            "- Un résultat qui CONTREDIT explicitement une ancre (autre ville claire, autre "
+            "employeur/métier incompatible, tranche d'âge manifestement différente) → score très "
+            "bas (0.0-0.2) : c'est très probablement un homonyme.\n"
+            "- Un résultat qui ne mentionne aucune ancre (ni corroboration ni contradiction) → "
+            "juge uniquement sur le nom, score moyen. L'ABSENCE d'information n'est PAS une "
+            "contradiction : ne pénalise jamais un résultat au seul motif qu'il ne cite pas les ancres.\n\n"
+        )
+
     return (
         f"Personne recherchée : {profile.full_name}\n"
         f"Variantes connues : {', '.join(profile.full_variants)}\n"
         f"Informations contextuelles disponibles : {contexte_connu or 'Aucune'}\n\n"
+        f"{anchors_block}"
         "Pour chaque résultat ci-dessous, donne un score de 0.0 à 1.0 "
         "indiquant la probabilité que ce résultat concerne la cible.\n\n"
         "Critères :\n"
@@ -103,14 +126,31 @@ async def filter_results(
     profile: NameProfile,
     search_id: str,
     callback: Optional[Callable] = None,
+    anchors: Optional[SearchAnchors] = None,
 ) -> list[OsintResult]:
-    """Filtre les résultats peu pertinents via l'API Claude, par batches de 50."""
+    """Filtre les résultats peu pertinents via l'API Claude, par batches de 50.
+
+    Si des ancres sont fournies, le prompt de scoring les utilise pour favoriser
+    les résultats qui les corroborent et rejeter ceux qui les contredisent.
+    Sans ancres, le comportement est identique à l'historique.
+    """
     if not results:
         return []
 
     if not settings.anthropic_api_key:
         logger.warning("[AI] ANTHROPIC_API_KEY absente, filtrage IA ignoré")
         return results
+
+    # Résumé des ancres (jamais bloquant : au pire on filtre sans ancres).
+    anchors_summary = ""
+    if anchors is not None:
+        try:
+            anchors_summary = anchors.to_prompt_summary()
+        except Exception as e:
+            logger.warning(f"[AI] Ancres ignorées pour le filtrage : {e}")
+            anchors_summary = ""
+    if anchors_summary:
+        logger.info(f"[AI] Filtrage ancré actif : {anchors_summary}")
 
     always_kept = [r for r in results if _is_always_kept(r)]
     to_score = [r for r in results if not _is_always_kept(r)]
@@ -130,7 +170,7 @@ async def filter_results(
                 system=_SYSTEM_PROMPT,
                 messages=[{
                     "role": "user",
-                    "content": _build_user_prompt(profile, context_summary, batch),
+                    "content": _build_user_prompt(profile, context_summary, batch, anchors_summary),
                 }],
             )
             raw_text = response.content[0].text if response.content else ""

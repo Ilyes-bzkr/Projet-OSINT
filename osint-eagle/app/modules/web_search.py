@@ -221,6 +221,25 @@ async def _run_single_dork(
         await asyncio.sleep(_RATE_LIMIT_DELAY)
 
 
+async def _with_browser(browser: Browser | None, runner: Callable) -> None:
+    """Exécute `runner(browser)` avec un navigateur partagé fourni par l'appelant.
+
+    Si `browser` est None (appel autonome / rétrocompatibilité), on lance puis
+    ferme un navigateur dédié. Sinon on réutilise le navigateur partagé sans le
+    fermer : sa fermeture incombe au propriétaire (l'orchestrateur).
+    """
+    if browser is not None:
+        await runner(browser)
+        return
+
+    async with async_playwright() as p:
+        own_browser = await p.chromium.launch()
+        try:
+            await runner(own_browser)
+        finally:
+            await own_browser.close()
+
+
 async def run_all_dorks(
     profile: NameProfile,
     search_id: str,
@@ -228,9 +247,16 @@ async def run_all_dorks(
     priority_only: bool = False,
     city_override: str | None = None,
     confirmed_platforms: list[str] | None = None,
+    browser: Browser | None = None,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> list[OsintResult]:
-    """Exécute tous les dorks générés par name_engine via scraping Bing (Playwright)."""
-    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DORKS)
+    """Exécute tous les dorks générés par name_engine via scraping Bing (Playwright).
+
+    `browser` et `semaphore` peuvent être partagés par l'orchestrateur pour
+    mutualiser un unique navigateur Chromium et plafonner la concurrence Bing
+    globale d'une recherche. À défaut, chaque appel reste autonome.
+    """
+    semaphore = semaphore or asyncio.Semaphore(_MAX_CONCURRENT_DORKS)
     seen_urls: set = set()
     results: list[OsintResult] = []
 
@@ -246,29 +272,27 @@ async def run_all_dorks(
             target = priority_specs if (category_key, idx) in priority_keys else secondary_specs
             target.append((category_key, _apply_city(query)))
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch()
-        try:
-            priority_tasks = [
-                _run_single_dork(semaphore, browser, category_key, query, search_id, callback, seen_urls, results)
-                for category_key, query in priority_specs
-            ]
-            logger.info(f"web_search : exécution de {len(priority_tasks)} dorks prioritaires pour '{profile.full_name}'")
-            await asyncio.gather(*priority_tasks)
+    async def _runner(active_browser: Browser):
+        priority_tasks = [
+            _run_single_dork(semaphore, active_browser, category_key, query, search_id, callback, seen_urls, results)
+            for category_key, query in priority_specs
+        ]
+        logger.info(f"web_search : exécution de {len(priority_tasks)} dorks prioritaires pour '{profile.full_name}'")
+        await asyncio.gather(*priority_tasks)
 
-            if priority_only:
-                logger.info("web_search : priority_only=True, dorks secondaires ignorés")
-            elif len(results) >= _MIN_PRIORITY_RESULTS:
-                secondary_tasks = [
-                    _run_single_dork(semaphore, browser, category_key, query, search_id, callback, seen_urls, results)
-                    for category_key, query in secondary_specs
-                ]
-                logger.info(f"web_search : exécution de {len(secondary_tasks)} dorks secondaires pour '{profile.full_name}'")
-                await asyncio.gather(*secondary_tasks)
-            else:
-                logger.warning("web_search : Aucun résultat web trouvé, empreinte faible")
-        finally:
-            await browser.close()
+        if priority_only:
+            logger.info("web_search : priority_only=True, dorks secondaires ignorés")
+        elif len(results) >= _MIN_PRIORITY_RESULTS:
+            secondary_tasks = [
+                _run_single_dork(semaphore, active_browser, category_key, query, search_id, callback, seen_urls, results)
+                for category_key, query in secondary_specs
+            ]
+            logger.info(f"web_search : exécution de {len(secondary_tasks)} dorks secondaires pour '{profile.full_name}'")
+            await asyncio.gather(*secondary_tasks)
+        else:
+            logger.warning("web_search : Aucun résultat web trouvé, empreinte faible")
+
+    await _with_browser(browser, _runner)
 
     logger.info(f"web_search : {len(results)} résultats uniques trouvés")
     return results
@@ -279,17 +303,21 @@ async def run_manual_dork(
     search_id: str,
     callback: Callable,
     category_key: str = "identity",
+    browser: Browser | None = None,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> list[OsintResult]:
-    """Exécute un unique dork Bing manuel (ex: numéro de téléphone, employeur) hors profil."""
-    semaphore = asyncio.Semaphore(1)
+    """Exécute un unique dork Bing manuel (ex: numéro de téléphone, employeur) hors profil.
+
+    `browser` et `semaphore` peuvent être partagés par l'orchestrateur (voir
+    run_all_dorks). À défaut, l'appel lance son propre navigateur.
+    """
+    semaphore = semaphore or asyncio.Semaphore(1)
     seen_urls: set = set()
     results: list[OsintResult] = []
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch()
-        try:
-            await _run_single_dork(semaphore, browser, category_key, query, search_id, callback, seen_urls, results)
-        finally:
-            await browser.close()
+    async def _runner(active_browser: Browser):
+        await _run_single_dork(semaphore, active_browser, category_key, query, search_id, callback, seen_urls, results)
+
+    await _with_browser(browser, _runner)
 
     return results

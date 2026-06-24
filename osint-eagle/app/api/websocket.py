@@ -243,7 +243,8 @@ async def _run_ai_pipeline(
         async def ai_progress_callback(message: str):
             await send_progress(websocket, search_id, "ai_analysis", "running", message, 50)
 
-        filtered = await filter_results(all_results, profile, search_id, ai_progress_callback)
+        anchors = getattr(request, "anchors", None)
+        filtered = await filter_results(all_results, profile, search_id, ai_progress_callback, anchors=anchors)
 
         await send_progress(websocket, search_id, "ai_analysis", "running", "Construction du profil de renseignement...", 70)
         ai_profile_data = await build_profile(filtered, profile, search_id)
@@ -294,10 +295,19 @@ async def handle_search_websocket(websocket: WebSocket):
         # Attendre la requête initiale
         raw = await websocket.receive_text()
         data = json.loads(raw)
+
+        # Robustesse : un champ "anchors" mal formé (type inattendu) ne doit jamais
+        # faire planter la recherche. On l'ignore et on repart sur des ancres vides.
+        if "anchors" in data and not isinstance(data["anchors"], dict):
+            logger.warning("Champ 'anchors' mal formé, ignoré (ancres vides par défaut)")
+            data.pop("anchors", None)
+
         request = SearchRequest(**data)
 
         search_id = str(uuid.uuid4())
-        logger.info(f"Recherche démarrée : {request.name} [{search_id}]")
+        active = request.anchors.active_labels()
+        anchors_log = f" | ancres : {', '.join(active)}" if active else ""
+        logger.info(f"Recherche démarrée : {request.name} [{search_id}]{anchors_log}")
 
         # Initialiser DB et sauvegarder la recherche
         await init_db()
