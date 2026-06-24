@@ -20,7 +20,7 @@ from app.core.logger import logger
 from app.models.result import ModuleType, OsintResult, ResultCategory, RiskLevel
 from app.models.search import NameProfile
 
-__all__ = ["run_all_dorks"]
+__all__ = ["run_all_dorks", "run_manual_dork"]
 
 _SENSITIVE_KEYWORDS = [
     "email", "@", "phone", "téléphone", "adresse", "mobile", "numéro",
@@ -40,6 +40,13 @@ _CATEGORY_MAP = {
 _MAX_RESULTS_PER_DORK = 5
 _MAX_CONCURRENT_DORKS = 2
 _RATE_LIMIT_DELAY = 2.0
+
+# Dorks prioritaires (identité, LinkedIn, GitHub, email, PDF) : exécutés en
+# premier. S'ils ne ramènent presque rien, l'empreinte web est faible et les
+# dorks secondaires (souvent à 0 résultat) sont coûteux pour rien (3
+# tentatives x 30s chacun) : on les saute.
+_PRIORITY_DORK_KEYS = {("identity", 0), ("contact", 0), ("professional", 0), ("technical", 0), ("documents", 0)}
+_MIN_PRIORITY_RESULTS = 3
 
 _BING_URL = "https://www.bing.com/search"
 _MAX_ATTEMPTS = 3
@@ -179,28 +186,72 @@ async def _run_single_dork(
         await asyncio.sleep(_RATE_LIMIT_DELAY)
 
 
-async def run_all_dorks(profile: NameProfile, search_id: str, callback: Callable) -> list[OsintResult]:
+async def run_all_dorks(
+    profile: NameProfile,
+    search_id: str,
+    callback: Callable,
+    priority_only: bool = False,
+    city_override: str | None = None,
+) -> list[OsintResult]:
     """Exécute tous les dorks générés par name_engine via scraping Bing (Playwright)."""
     semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DORKS)
     seen_urls: set = set()
     results: list[OsintResult] = []
 
-    tasks = []
+    def _apply_city(query: str) -> str:
+        return f'{query} "{city_override}"' if city_override else query
+
+    priority_specs: list[tuple[str, str]] = []
+    secondary_specs: list[tuple[str, str]] = []
+    for category_key, queries in profile.search_queries.items():
+        for idx, query in enumerate(queries):
+            target = priority_specs if (category_key, idx) in _PRIORITY_DORK_KEYS else secondary_specs
+            target.append((category_key, _apply_city(query)))
+
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         try:
-            for category_key, queries in profile.search_queries.items():
-                for query in queries:
-                    tasks.append(
-                        _run_single_dork(
-                            semaphore, browser, category_key, query, search_id, callback, seen_urls, results
-                        )
-                    )
+            priority_tasks = [
+                _run_single_dork(semaphore, browser, category_key, query, search_id, callback, seen_urls, results)
+                for category_key, query in priority_specs
+            ]
+            logger.info(f"web_search : exécution de {len(priority_tasks)} dorks prioritaires pour '{profile.full_name}'")
+            await asyncio.gather(*priority_tasks)
 
-            logger.info(f"web_search : exécution de {len(tasks)} dorks pour '{profile.full_name}'")
-            await asyncio.gather(*tasks)
+            if priority_only:
+                logger.info("web_search : priority_only=True, dorks secondaires ignorés")
+            elif len(results) >= _MIN_PRIORITY_RESULTS:
+                secondary_tasks = [
+                    _run_single_dork(semaphore, browser, category_key, query, search_id, callback, seen_urls, results)
+                    for category_key, query in secondary_specs
+                ]
+                logger.info(f"web_search : exécution de {len(secondary_tasks)} dorks secondaires pour '{profile.full_name}'")
+                await asyncio.gather(*secondary_tasks)
+            else:
+                logger.warning("web_search : Aucun résultat web trouvé, empreinte faible")
         finally:
             await browser.close()
 
     logger.info(f"web_search : {len(results)} résultats uniques trouvés")
+    return results
+
+
+async def run_manual_dork(
+    query: str,
+    search_id: str,
+    callback: Callable,
+    category_key: str = "identity",
+) -> list[OsintResult]:
+    """Exécute un unique dork Bing manuel (ex: numéro de téléphone, employeur) hors profil."""
+    semaphore = asyncio.Semaphore(1)
+    seen_urls: set = set()
+    results: list[OsintResult] = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        try:
+            await _run_single_dork(semaphore, browser, category_key, query, search_id, callback, seen_urls, results)
+        finally:
+            await browser.close()
+
     return results
