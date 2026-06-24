@@ -11,6 +11,7 @@ mais n'est plus utilisé.
 
 import asyncio
 import json
+import urllib.parse
 from tempfile import TemporaryDirectory
 from typing import Optional
 
@@ -20,12 +21,13 @@ from playwright.async_api import async_playwright
 from app.ai.analyzer import filter_results
 from app.core.config import settings
 from app.core.logger import logger
-from app.models.result import OsintResult, WebSocketMessage
+from app.models.result import ModuleType, OsintResult, WebSocketMessage
 from app.models.search import NameProfile, SearchRequest
 from app.modules import exif_extractor, gravatar_checker, holehe_checker, reverse_image
 from app.modules.breach_checker import check_breaches
 from app.modules.github_search import search_github
 from app.modules.name_engine import generate_search_profile
+from app.modules.paste_search import search_pastes
 from app.modules.social_checker import check_all_platforms
 from app.modules.web_search import run_all_dorks, run_manual_dork
 
@@ -160,34 +162,62 @@ async def _extract_identifiers(results: list[OsintResult], profile: NameProfile,
     return identifiers
 
 
+def _extract_platform_domain(result: OsintResult) -> Optional[str]:
+    """Domaine de la plateforme confirmée par social_checker (ex: 'github.com')."""
+    if not result.url:
+        return None
+    netloc = urllib.parse.urlparse(result.url).netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc or None
+
+
 async def run_layer1(
     profile: NameProfile,
     search_id: str,
     callback,
     websocket,
 ) -> tuple[list[OsintResult], dict]:
-    """Couche 1 — ancrage : dorks prioritaires + github + social (5 premiers variants)."""
+    """Couche 1 — ancrage, en 2 sous-étapes :
+    1A (parallèle)   : social (5 premiers variants) + github + paste, sur le nom brut
+    1B (séquentielle): dorks web, dont les dorks plateformes sont adaptés aux comptes
+                       confirmés par social_checker en 1A.
+    """
     from app.api.websocket import send_progress
 
-    for module_name in ("web_search", "github", "social"):
-        await send_progress(websocket, search_id, module_name, "running", f"Module {module_name} en cours...", 15)
+    for module_name in ("social", "github", "paste"):
+        await send_progress(websocket, search_id, module_name, "running", f"Module {module_name} en cours...", 12)
 
-    web_results, github_results, social_results = await asyncio.gather(
-        _safe_run(run_all_dorks(profile, search_id, callback, priority_only=True), "web_search"),
-        _safe_run(search_github(profile, search_id, callback), "github"),
+    social_results, github_results, paste_results = await asyncio.gather(
         _safe_run(
             check_all_platforms(profile, search_id, callback, max_variants=_LAYER1_SOCIAL_VARIANTS),
             "social",
         ),
+        _safe_run(search_github(profile, search_id, callback), "github"),
+        _safe_run(search_pastes(profile, search_id, callback), "paste"),
     )
 
-    for module_name in ("web_search", "github", "social"):
+    for module_name in ("social", "github", "paste"):
         await send_progress(websocket, search_id, module_name, "completed", f"Module {module_name} terminé", 100)
 
-    results_l1 = web_results + github_results + social_results
+    confirmed_platforms = sorted({
+        domain
+        for r in social_results
+        if r.module == ModuleType.SOCIAL and (domain := _extract_platform_domain(r))
+    })
+    logger.info(f"[intelligence_engine] Couche 1A : plateformes confirmées = {confirmed_platforms}")
+
+    await send_progress(websocket, search_id, "web_search", "running", "Dorks web (adaptatifs)...", 30)
+    web_results = await _safe_run(
+        run_all_dorks(profile, search_id, callback, priority_only=True, confirmed_platforms=confirmed_platforms),
+        "web_search",
+    )
+    await send_progress(websocket, search_id, "web_search", "completed", "Module web_search terminé", 100)
+
+    results_l1 = social_results + github_results + paste_results + web_results
 
     # Filtrage IA avant extraction pour ancrer le prompt sur des résultats pertinents
-    # (le scraping web renvoie souvent des pages hors-sujet).
+    # (le scraping web et les pastes renvoient souvent des pages hors-sujet).
     anchored_results = await filter_results(results_l1, profile, search_id)
     identifiers = await _extract_identifiers(anchored_results, profile, search_id)
 
