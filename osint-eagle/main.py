@@ -54,10 +54,16 @@ async def serve_frontend():
     return FileResponse(str(static_path / "index.html"))
 
 if __name__ == "__main__":
+    # ws_ping_interval / ws_ping_timeout : ping WebSocket au niveau protocole
+    # (renforce le heartbeat applicatif). Supportés par uvicorn >= 0.49 + le
+    # backend "websockets" installé. Si une version d'uvicorn plus ancienne ne
+    # les acceptait pas, uvicorn.run lèverait un TypeError explicite au démarrage.
     uvicorn.run(
         "main:app",
         host="127.0.0.1",
         port=8000,
         reload=True,
-        log_level="info"
+        log_level="info",
+        ws_ping_interval=20,
+        ws_ping_timeout=60,
     )

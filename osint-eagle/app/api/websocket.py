@@ -255,6 +255,53 @@ async def run_search(websocket: WebSocket, request: SearchRequest, search_id: st
     return total_results, ai_risk_score
 
 
+# Intervalle entre deux battements de heartbeat pendant l'analyse IA. Les
+# navigateurs ferment une WebSocket inactive ~60s : 15s laisse une marge large.
+_AI_HEARTBEAT_INTERVAL = 15.0
+# Pourcentage stable émis par le heartbeat : volontairement constant pour ne pas
+# faire osciller la barre de progression à chaque battement.
+_AI_HEARTBEAT_PROGRESS = 55
+
+
+async def _ai_heartbeat(websocket: WebSocket, search_id: str) -> None:
+    """Maintient la connexion WebSocket vivante pendant les longues étapes IA.
+
+    Émet un message de progression léger toutes les _AI_HEARTBEAT_INTERVAL s. Le
+    filtrage, la construction du profil (jusqu'à 120s) et la génération du rapport
+    peuvent chacun durer > 60s sans aucun trafic : sans ce battement, le navigateur
+    fermerait la socket et le message "ai_profile" final n'arriverait jamais.
+
+    Robustesse : respecte websocket.state.is_connected (s'arrête de lui-même si la
+    connexion est fermée) et absorbe toute erreur d'envoi — il ne doit JAMAIS faire
+    planter le pipeline IA. Arrêté par task.cancel() en fin de pipeline.
+    """
+    while True:
+        await asyncio.sleep(_AI_HEARTBEAT_INTERVAL)
+        if not getattr(websocket.state, "is_connected", True):
+            return
+        try:
+            await send_progress(
+                websocket, search_id, "ai_analysis", "running",
+                "Analyse IA en cours...", _AI_HEARTBEAT_PROGRESS,
+            )
+        except Exception:
+            # Socket fermée pendant l'envoi : on s'arrête silencieusement.
+            return
+
+
+async def _stop_heartbeat(task: Optional[asyncio.Task]) -> None:
+    """Annule proprement la tâche heartbeat (idempotent, absorbe CancelledError)."""
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+
 async def _run_ai_pipeline(
     websocket: WebSocket,
     search_id: str,
@@ -280,17 +327,27 @@ async def _run_ai_pipeline(
         "Filtrage des résultats par intelligence artificielle...", 10
     )
 
+    # Heartbeat couvrant TOUTE l'analyse IA (filtrage + profil + rapport). Démarré
+    # ici, juste après les vérifications et le premier send_progress, AVANT le
+    # filtrage (qui peut à lui seul dépasser 60s). Le try/finally garantit son
+    # annulation quoi qu'il arrive (succès, exception, retour anticipé).
+    heartbeat_task = asyncio.create_task(_ai_heartbeat(websocket, search_id))
     try:
         async def ai_progress_callback(message: str):
             await send_progress(websocket, search_id, "ai_analysis", "running", message, 50)
 
         anchors = getattr(request, "anchors", None)
+        logger.info("[AI] Démarrage du filtrage (heartbeat actif)...")
         filtered = await filter_results(all_results, profile, search_id, ai_progress_callback, anchors=anchors)
+        logger.info(f"[AI] Filtrage terminé : {len(filtered)} résultats retenus")
 
         await send_progress(websocket, search_id, "ai_analysis", "running", "Construction du profil de renseignement...", 70)
+        logger.info("[AI] Construction du profil (jusqu'à 120s)...")
         ai_profile_data = await build_profile(filtered, profile, search_id)
+        logger.info("[AI] Profil construit")
 
         await send_progress(websocket, search_id, "ai_analysis", "running", "Génération du rapport final...", 90)
+        logger.info("[AI] Génération du rapport HTML...")
         ai_html = await generate_report_html(ai_profile_data, profile)
 
         ai_risk_score = None
@@ -302,6 +359,10 @@ async def _run_ai_pipeline(
         filtered_count = len(filtered)
         filter_rate = f"{round((1 - filtered_count / total_count) * 100)}%" if total_count else "0%"
 
+        # On arrête le heartbeat juste AVANT d'envoyer le profil : aucun battement
+        # résiduel ne doit subsister après le message "ai_profile".
+        await _stop_heartbeat(heartbeat_task)
+        logger.info("[AI] Envoi du profil au frontend")
         await send_message(websocket, WebSocketMessage(
             type="ai_profile",
             search_id=search_id,
@@ -321,6 +382,9 @@ async def _run_ai_pipeline(
         logger.error(f"Erreur pipeline IA : {e}")
         await send_progress(websocket, search_id, "ai_analysis", "failed", "Erreur lors de l'analyse IA", 100)
         return None
+    finally:
+        # Garantit l'annulation du heartbeat dans tous les cas (idempotent).
+        await _stop_heartbeat(heartbeat_task)
 
 
 async def handle_search_websocket(websocket: WebSocket):
