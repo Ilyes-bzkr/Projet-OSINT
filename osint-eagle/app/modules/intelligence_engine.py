@@ -38,6 +38,11 @@ _LAYER1_MAX_TOKENS = 500
 _LAYER1_TIMEOUT = 60.0
 _LAYER1_MAX_RESULTS = 80
 _LAYER1_SOCIAL_VARIANTS = 5
+# Couche 2 : on n'approfondit Maigret que sur les usernames les plus pertinents,
+# en série et sur un sous-ensemble de sites réduit (approfondissement, pas besoin
+# d'un large scan). Évite le cas observé de dix scans Maigret lancés en parallèle.
+_LAYER2_MAX_SOCIAL_USERNAMES = 2
+_LAYER2_SOCIAL_TOP_SITES = 50
 _VIDEO_FRAME_COUNT = 3
 
 # Concurrence Bing maximale pour TOUS les dorks web d'une recherche, partagée
@@ -425,9 +430,17 @@ async def run_layer2(
         tasks.append(_safe_run(_dispatch(gravatar_checker.check_gravatar(email, search_id), callback), "gravatar"))
         tasks.append(_safe_run(check_breaches([email], [], search_id, callback), "breach"))
 
-    for username in usernames:
+    # Un SEUL appel Maigret pour la couche 2 : au plus _LAYER2_MAX_SOCIAL_USERNAMES
+    # usernames (les plus pertinents en tête de liste), scannés en série en interne,
+    # sur top _LAYER2_SOCIAL_TOP_SITES. Remplace l'ancien lancement d'un scan
+    # Maigret par username (jusqu'à dix en parallèle).
+    social_usernames = usernames[:_LAYER2_MAX_SOCIAL_USERNAMES]
+    if social_usernames:
         tasks.append(_safe_run(
-            check_all_platforms(profile, search_id, callback, username_override=username),
+            check_all_platforms(
+                profile, search_id, callback,
+                usernames=social_usernames, top_sites=_LAYER2_SOCIAL_TOP_SITES,
+            ),
             "social_username",
         ))
 

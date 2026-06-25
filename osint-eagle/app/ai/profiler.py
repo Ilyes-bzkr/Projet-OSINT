@@ -4,6 +4,7 @@ Agrégation cross-sources en profil structuré via Claude.
 """
 
 import json
+import re
 import urllib.parse
 
 from anthropic import AsyncAnthropic
@@ -14,8 +15,13 @@ from app.models.result import OsintResult
 from app.models.search import NameProfile
 
 _MODEL = "claude-sonnet-4-6"
-_MAX_TOKENS = 4000
-_TIMEOUT = 60.0
+# Le schéma de profil (11 sections) génère un JSON volumineux : 4000 tokens le
+# tronquaient systématiquement -> json.loads échouait -> fallback minimal à chaque
+# recherche. 8000 laisse une marge confortable (claude-sonnet-4-6 le supporte).
+_MAX_TOKENS = 8000
+# Timeout relevé en conséquence : 8000 tokens de sortie demandent plus de temps
+# de génération que 4000, on évite ainsi de couper la réponse en plein vol.
+_TIMEOUT = 120.0
 _MAX_RESULTS = 50
 _SNIPPET_MAX_LEN = 150
 
@@ -160,6 +166,70 @@ def _clean_json_text(raw_text: str) -> str:
     return text.strip()
 
 
+def _repair_truncated_json(text: str) -> str | None:
+    """Tente de réparer un JSON coupé en plein vol (réponse tronquée).
+
+    Heuristique : ferme une éventuelle chaîne non terminée, supprime une virgule
+    ou une paire "clé": pendante, puis referme toutes les accolades/crochets
+    restés ouverts. Couvre les troncatures les plus fréquentes (coupure au milieu
+    d'une valeur ou après une virgule). Retourne None si rien d'exploitable.
+    """
+    text = text.strip()
+    if not text:
+        return None
+
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch in "}]" and stack:
+            stack.pop()
+
+    repaired = text
+    if in_string:  # chaîne non terminée (cas le plus fréquent) -> on la ferme
+        repaired += '"'
+
+    repaired = repaired.rstrip()
+    repaired = re.sub(r",\s*$", "", repaired)                 # virgule pendante
+    repaired = re.sub(r',?\s*"[^"]*"\s*:\s*$', "", repaired)  # paire "clé": sans valeur
+    repaired = repaired.rstrip().rstrip(",")
+
+    for closer in reversed(stack):
+        repaired += closer
+
+    return repaired if repaired != text else None
+
+
+def _parse_profile_json(text: str) -> dict | None:
+    """Parse le JSON du profil, avec réparation d'une troncature résiduelle."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    repaired = _repair_truncated_json(text)
+    if repaired:
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
 def _minimal_fallback_profile(profile: NameProfile, results: list[OsintResult]) -> dict:
     """Profil minimal construit directement depuis les résultats, sans IA."""
     emails = []
@@ -254,11 +324,18 @@ async def build_profile(
             )
             raw_text = response.content[0].text if response.content else ""
             cleaned = _clean_json_text(raw_text)
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
+            parsed = _parse_profile_json(cleaned)
+            if parsed is not None:
+                if attempt == 0 and not raw_text.rstrip().endswith("}"):
+                    logger.info("[AI] Profil récupéré après réparation d'une réponse tronquée")
+                return parsed
+            # Échec malgré la réparation : on logge début ET fin pour confirmer
+            # visuellement une troncature (le JSON commence bien mais finit coupé).
+            stop_reason = getattr(response, "stop_reason", None)
             logger.warning(
-                f"[AI] JSON malformé du profil (tentative {attempt + 1}/2), "
-                f"raw_response[:100]={raw_text[:100]!r}"
+                f"[AI] JSON malformé du profil (tentative {attempt + 1}/2, "
+                f"stop_reason={stop_reason}) | début={raw_text[:100]!r} | "
+                f"fin={raw_text[-100:]!r}"
             )
             continue
         except Exception as e:

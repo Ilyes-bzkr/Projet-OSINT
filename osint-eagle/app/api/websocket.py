@@ -28,13 +28,24 @@ from app.modules.web_search import run_all_dorks
 
 
 async def send_message(websocket: WebSocket, msg: WebSocketMessage):
-    """Envoie un message JSON via WebSocket, si la connexion est toujours active."""
+    """Envoie un message JSON via WebSocket, si la connexion est toujours active.
+
+    Garde-fou : on n'émet jamais sur une socket déjà marquée fermée, et à la
+    PREMIÈRE erreur d'envoi on bascule l'indicateur `is_connected` à False. Les
+    émissions suivantes (souvent des dizaines, lancées en parallèle par les
+    callbacks de streaming) court-circuitent alors sans log, ce qui évite la
+    marée de « Cannot call send once a close message has been sent ». Les modules
+    continuent de tourner et de persister en base : seule l'émission WS est coupée.
+    """
     if not getattr(websocket.state, "is_connected", True):
         return
     try:
         await websocket.send_text(msg.model_dump_json())
     except Exception as e:
-        logger.warning(f"Erreur envoi WebSocket : {e}")
+        # On ne logge qu'au moment où l'on bascule l'état (premier échec), pas à
+        # chaque envoi concurrent qui échouerait après la fermeture.
+        if getattr(websocket.state, "is_connected", True):
+            logger.warning(f"WebSocket fermé, arrêt des émissions : {e}")
         websocket.state.is_connected = False
 
 
@@ -98,6 +109,36 @@ async def _save_result_to_db(result: OsintResult):
             await session.commit()
     except Exception as e:
         logger.warning(f"Erreur sauvegarde résultat en DB : {e}")
+
+
+async def _create_search_record(search_id: str, name_query: str):
+    """Crée l'enregistrement de recherche (session courte, échec non bloquant)."""
+    try:
+        async with AsyncSessionLocal() as session:
+            session.add(SearchRecord(
+                id=search_id,
+                name_query=name_query,
+                created_at=datetime.utcnow(),
+                status="running",
+            ))
+            await session.commit()
+    except Exception as e:
+        logger.warning(f"Erreur création SearchRecord en DB : {e}")
+
+
+async def _mark_search_completed(search_id: str, total_results: int, risk_score: Optional[float]):
+    """Marque la recherche comme terminée (session courte, échec non bloquant)."""
+    try:
+        async with AsyncSessionLocal() as session:
+            record = await session.get(SearchRecord, search_id)
+            if record:
+                record.status = "completed"
+                record.completed_at = datetime.utcnow()
+                record.total_results = total_results
+                record.risk_score = risk_score
+                await session.commit()
+    except Exception as e:
+        logger.warning(f"Erreur mise à jour SearchRecord (completed) en DB : {e}")
 
 
 async def _handle_result(websocket: WebSocket, search_id: str, module_name: str, result: OsintResult):
@@ -311,15 +352,7 @@ async def handle_search_websocket(websocket: WebSocket):
 
         # Initialiser DB et sauvegarder la recherche
         await init_db()
-        async with AsyncSessionLocal() as session:
-            record = SearchRecord(
-                id=search_id,
-                name_query=request.name,
-                created_at=datetime.utcnow(),
-                status="running"
-            )
-            session.add(record)
-            await session.commit()
+        await _create_search_record(search_id, request.name)
 
         # Confirmer le démarrage au frontend
         await send_message(websocket, WebSocketMessage(
@@ -334,14 +367,7 @@ async def handle_search_websocket(websocket: WebSocket):
         total_results, risk_score = await run_intelligence_engine(websocket, request, search_id)
 
         # Marquer comme terminé en DB
-        async with AsyncSessionLocal() as session:
-            result = await session.get(SearchRecord, search_id)
-            if result:
-                result.status = "completed"
-                result.completed_at = datetime.utcnow()
-                result.total_results = total_results
-                result.risk_score = risk_score
-                await session.commit()
+        await _mark_search_completed(search_id, total_results, risk_score)
 
     except WebSocketDisconnect:
         websocket.state.is_connected = False

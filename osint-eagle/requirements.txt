@@ -19,3 +19,10 @@ pytest-asyncio==0.24.0
 httpx==0.27.2
 holehe==1.61
 Pillow==12.2.0
+# maigret : moteur de vérification des comptes sociaux (remplace l'ancien
+# check "HTTP 200" de social_checker). Vérifie le contenu des pages et n'accepte
+# que les comptes réellement trouvés -> élimine les faux positifs.
+# NB : tire de nombreuses dépendances transitives (aiohttp, curl-cffi, networkx,
+# pyvis, reportlab, Flask, ipython...). Aucun conflit de version constaté avec
+# les paquets ci-dessus, mais l'installation est volumineuse.
+maigret==0.6.1
