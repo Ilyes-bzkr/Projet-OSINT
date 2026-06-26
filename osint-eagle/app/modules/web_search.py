@@ -10,10 +10,13 @@ retente donc plusieurs fois avec une page fraîche avant d'abandonner un dork.
 """
 
 import asyncio
+import os
 import random
 import urllib.parse
+from pathlib import Path
 from typing import Callable
 
+import httpx
 from playwright.async_api import Browser, Error as PlaywrightError, async_playwright
 
 from app.core.logger import logger
@@ -90,6 +93,32 @@ _GOTO_TIMEOUT = 20000  # ms
 _RESULT_WAIT_TIMEOUT = 5000  # ms
 _DORK_TIMEOUT = 90  # secondes, couvre toutes les tentatives d'un dork
 
+# Sélecteur d'extraction des résultats organiques Bing (centralisé pour que le
+# mode debug puisse logguer celui réellement utilisé).
+_BING_RESULT_SELECTOR = ".b_algo"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODE DEBUG TEMPORAIRE — diagnostic Bing/Playwright (0 résultat en headless).
+# À RETIRER une fois la cause confirmée. Se déclenche pour la SEULE requête de
+# test contenant à la fois "bouzekri" et "ilyes" (la recherche en phrase exacte
+# "bouzekri ilyes"). Produit : URL finale, debug_bing.html, debug_bing.png,
+# nombre d'éléments matchés par le sélecteur, et détection de wall/captcha.
+# ─────────────────────────────────────────────────────────────────────────────
+_DEBUG_BING_ENABLED = True
+_DEBUG_OUTPUT_DIR = Path(__file__).resolve().parents[2]  # racine du projet osint-eagle
+_DEBUG_WALL_TERMS = (
+    "consent", "accept", "j'accepte", "cookie", "avant de continuer",
+    "captcha", "verifying", "are you a robot", "blocked",
+)
+# Garde-fou : ne dumper qu'UNE fois (la 1re tentative) même si le dork est retenté.
+_debug_dumped = False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠️ CODE BING/PLAYWRIGHT DÉPRÉCIÉ — CONSERVÉ TEMPORAIREMENT POUR ROLLBACK.
+# Plus appelé par run_all_dorks / run_manual_dork (qui passent par SearXNG).
+# Inclut le mode debug Bing. À SUPPRIMER (avec _DEBUG_BING_ENABLED et les fichiers
+# debug_bing.*) lors de l'étape de nettoyage, UNE FOIS SearXNG validé.
+# ─────────────────────────────────────────────────────────────────────────────
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -115,15 +144,82 @@ def _build_bing_url(query: str, count: int) -> str:
     return f"{_BING_URL}?{urllib.parse.urlencode(params)}"
 
 
+def _is_debug_query(query: str) -> bool:
+    """True pour la SEULE requête de diagnostic ("bouzekri ilyes", tout ordre)."""
+    if not _DEBUG_BING_ENABLED:
+        return False
+    q = (query or "").lower()
+    return "bouzekri" in q and "ilyes" in q
+
+
+async def _debug_dump_bing(page, query: str, url: str) -> None:
+    """Produit les artefacts de diagnostic pour une page Bing : URL réelle, HTML
+    complet, screenshot pleine page, nombre d'éléments matchés et détection wall.
+
+    Absorbe toute erreur : le diagnostic ne doit jamais casser la recherche.
+    """
+    global _debug_dumped
+    if _debug_dumped:
+        return
+    _debug_dumped = True
+
+    # Attente de chargement réelle (networkidle si possible) avant capture.
+    try:
+        await page.wait_for_load_state("networkidle", timeout=8000)
+    except PlaywrightError:
+        logger.warning("[DEBUG bing] networkidle non atteint (timeout), capture quand même")
+    await page.wait_for_timeout(3000)
+
+    logger.warning(f"[DEBUG bing] query de test : {query!r}")
+    logger.warning(f"[DEBUG bing] URL construite : {url}")
+    try:
+        logger.warning(f"[DEBUG bing] URL réelle (après redirections) : {page.url}")
+        logger.warning(f"[DEBUG bing] <title> : {(await page.title())!r}")
+    except Exception as e:
+        logger.warning(f"[DEBUG bing] lecture url/title impossible : {e}")
+
+    html = ""
+    try:
+        html = await page.content()
+        html_path = _DEBUG_OUTPUT_DIR / "debug_bing.html"
+        html_path.write_text(html, encoding="utf-8")
+        logger.warning(f"[DEBUG bing] HTML sauvegardé ({len(html)} octets) → {html_path}")
+    except Exception as e:
+        logger.warning(f"[DEBUG bing] échec sauvegarde HTML : {e}")
+
+    try:
+        png_path = _DEBUG_OUTPUT_DIR / "debug_bing.png"
+        await page.screenshot(path=str(png_path), full_page=True)
+        logger.warning(f"[DEBUG bing] screenshot sauvegardé → {png_path}")
+    except Exception as e:
+        logger.warning(f"[DEBUG bing] échec screenshot : {e}")
+
+    try:
+        count = await page.locator(_BING_RESULT_SELECTOR).count()
+        logger.warning(f"[DEBUG bing] sélecteur d'extraction : '{_BING_RESULT_SELECTOR}' → {count} élément(s) matché(s)")
+    except Exception as e:
+        logger.warning(f"[DEBUG bing] comptage sélecteur impossible : {e}")
+
+    lowered = html.lower()
+    found = [term for term in _DEBUG_WALL_TERMS if term in lowered]
+    logger.warning(f"[DEBUG bing] indices wall/consent/captcha présents dans le HTML : {found or 'aucun'}")
+
+
 async def _scrape_bing_once(browser: Browser, query: str, max_results: int) -> list[dict]:
     page = await browser.new_page(user_agent=_random_ua())
     raw_items: list[dict] = []
+    debug = _is_debug_query(query)
     try:
-        await page.goto(_build_bing_url(query, max_results), timeout=_GOTO_TIMEOUT, wait_until="load")
+        url = _build_bing_url(query, max_results)
+        await page.goto(url, timeout=_GOTO_TIMEOUT, wait_until="load")
         await page.wait_for_timeout(1200)
-        await page.wait_for_selector(".b_algo", timeout=_RESULT_WAIT_TIMEOUT)
+        # Diagnostic : capturer la page (HTML + screenshot) AVANT le wait_for_selector,
+        # qui lève si '.b_algo' est absent — on veut justement voir ce que Bing sert.
+        if debug:
+            await _debug_dump_bing(page, query, url)
+        await page.wait_for_selector(_BING_RESULT_SELECTOR, timeout=_RESULT_WAIT_TIMEOUT)
         raw_items = await page.eval_on_selector_all(
-            ".b_algo",
+            _BING_RESULT_SELECTOR,
             """els => els.map(el => {
                 const a = el.querySelector("h2 a");
                 const cap = el.querySelector(".b_caption p") || el.querySelector("p");
@@ -167,9 +263,95 @@ def _evaluate_risk(category: ResultCategory, snippet: str) -> tuple[RiskLevel, b
     return RiskLevel.LOW, False
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CANAL ACTIF : SearXNG auto-hébergé (métamoteur local, API JSON).
+# Remplace le scraping Bing/Playwright (qui se faisait servir un challenge
+# anti-bot Cloudflare). On ne consomme qu'une API JSON locale légitime ; aucun
+# contournement de captcha n'est codé ici (SearXNG gère ses propres moteurs).
+# L'URL de base est lue dans l'env SEARXNG_URL (défaut http://localhost:8888).
+# ─────────────────────────────────────────────────────────────────────────────
+_SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://localhost:8888").rstrip("/")
+_SEARXNG_TIMEOUT = 15.0
+# Moteurs généralistes fiables interrogés (redondance = robustesse). Doivent être
+# activés côté settings.yml.
+_SEARXNG_ENGINES = "google,bing,duckduckgo,brave,mojeek"
+# Drapeau de debug temporaire : logge l'URL appelée et le nombre de résultats
+# bruts reçus. Retirable après validation.
+_DEBUG_SEARXNG = True
+
+
+async def _search_searxng(query: str, max_results: int) -> list[dict]:
+    """Interroge l'API JSON de SearXNG et renvoie une liste de dicts
+    {title, href, body} — MÊME contrat que l'ancien scraping Bing.
+
+    Ne lève jamais : en cas de problème (injoignable, HTML au lieu de JSON,
+    statut inattendu), logge un WARNING clair et renvoie une liste vide.
+    """
+    params = {"q": query, "format": "json", "engines": _SEARXNG_ENGINES}
+    search_url = f"{_SEARXNG_URL}/search"
+
+    try:
+        async with httpx.AsyncClient(timeout=_SEARXNG_TIMEOUT) as client:
+            resp = await client.get(search_url, params=params)
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+        logger.warning(
+            f"web_search : SearXNG injoignable sur {_SEARXNG_URL} — "
+            f"vérifier que le conteneur Docker tourne ({type(e).__name__})"
+        )
+        return []
+    except httpx.HTTPError as e:
+        logger.warning(f"web_search : erreur HTTP SearXNG pour '{query}' : {e}")
+        return []
+
+    if _DEBUG_SEARXNG:
+        logger.info(f"[DEBUG searxng] GET {resp.url} → HTTP {resp.status_code}")
+
+    # 429 : un moteur amont (ou le limiter) a throttlé. On ne crashe pas ; on
+    # tente quand même de récupérer ce que SearXNG a pu agréger.
+    if resp.status_code == 429:
+        logger.warning(
+            f"web_search : SearXNG a renvoyé 429 (rate limit amont) pour '{query}', "
+            "récupération partielle"
+        )
+    elif resp.status_code != 200:
+        logger.warning(f"web_search : SearXNG statut {resp.status_code} pour '{query}'")
+        return []
+
+    # Format JSON pas activé dans settings.yml → SearXNG sert du HTML.
+    content_type = resp.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        logger.warning(
+            "web_search : SearXNG a renvoyé du HTML, le format JSON n'est pas activé "
+            "dans settings.yml (section search.formats : ajouter 'json')"
+        )
+        return []
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        logger.warning(f"web_search : réponse SearXNG illisible pour '{query}' : {e}")
+        return []
+
+    raw_results = data.get("results") or []
+    if _DEBUG_SEARXNG:
+        logger.info(f"[DEBUG searxng] '{query}' → {len(raw_results)} résultats bruts reçus")
+
+    items: list[dict] = []
+    seen: set[str] = set()
+    for entry in raw_results:
+        href = entry.get("url")
+        title = entry.get("title")
+        if not href or not title or href in seen:
+            continue
+        seen.add(href)
+        items.append({"title": title, "href": href, "body": entry.get("content")})
+        if len(items) >= max_results:
+            break
+    return items
+
+
 async def _run_single_dork(
     semaphore: asyncio.Semaphore,
-    browser: Browser,
     category_key: str,
     query: str,
     search_id: str,
@@ -182,7 +364,7 @@ async def _run_single_dork(
     async with semaphore:
         try:
             raw_results = await asyncio.wait_for(
-                _scrape_bing(browser, query, _MAX_RESULTS_PER_DORK),
+                _search_searxng(query, _MAX_RESULTS_PER_DORK),
                 timeout=_DORK_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -250,11 +432,12 @@ async def run_all_dorks(
     browser: Browser | None = None,
     semaphore: asyncio.Semaphore | None = None,
 ) -> list[OsintResult]:
-    """Exécute tous les dorks générés par name_engine via scraping Bing (Playwright).
+    """Exécute tous les dorks générés par name_engine via SearXNG (API JSON locale).
 
-    `browser` et `semaphore` peuvent être partagés par l'orchestrateur pour
-    mutualiser un unique navigateur Chromium et plafonner la concurrence Bing
-    globale d'une recherche. À défaut, chaque appel reste autonome.
+    `semaphore` peut être partagé par l'orchestrateur pour plafonner la concurrence
+    web globale d'une recherche. `browser` est conservé pour rétrocompatibilité de
+    signature (l'orchestrateur le passe encore) mais n'est plus utilisé : le canal
+    web ne dépend plus de Playwright.
     """
     semaphore = semaphore or asyncio.Semaphore(_MAX_CONCURRENT_DORKS)
     seen_urls: set = set()
@@ -272,27 +455,24 @@ async def run_all_dorks(
             target = priority_specs if (category_key, idx) in priority_keys else secondary_specs
             target.append((category_key, _apply_city(query)))
 
-    async def _runner(active_browser: Browser):
-        priority_tasks = [
-            _run_single_dork(semaphore, active_browser, category_key, query, search_id, callback, seen_urls, results)
-            for category_key, query in priority_specs
+    priority_tasks = [
+        _run_single_dork(semaphore, category_key, query, search_id, callback, seen_urls, results)
+        for category_key, query in priority_specs
+    ]
+    logger.info(f"web_search : exécution de {len(priority_tasks)} dorks prioritaires pour '{profile.full_name}'")
+    await asyncio.gather(*priority_tasks)
+
+    if priority_only:
+        logger.info("web_search : priority_only=True, dorks secondaires ignorés")
+    elif len(results) >= _MIN_PRIORITY_RESULTS:
+        secondary_tasks = [
+            _run_single_dork(semaphore, category_key, query, search_id, callback, seen_urls, results)
+            for category_key, query in secondary_specs
         ]
-        logger.info(f"web_search : exécution de {len(priority_tasks)} dorks prioritaires pour '{profile.full_name}'")
-        await asyncio.gather(*priority_tasks)
-
-        if priority_only:
-            logger.info("web_search : priority_only=True, dorks secondaires ignorés")
-        elif len(results) >= _MIN_PRIORITY_RESULTS:
-            secondary_tasks = [
-                _run_single_dork(semaphore, active_browser, category_key, query, search_id, callback, seen_urls, results)
-                for category_key, query in secondary_specs
-            ]
-            logger.info(f"web_search : exécution de {len(secondary_tasks)} dorks secondaires pour '{profile.full_name}'")
-            await asyncio.gather(*secondary_tasks)
-        else:
-            logger.warning("web_search : Aucun résultat web trouvé, empreinte faible")
-
-    await _with_browser(browser, _runner)
+        logger.info(f"web_search : exécution de {len(secondary_tasks)} dorks secondaires pour '{profile.full_name}'")
+        await asyncio.gather(*secondary_tasks)
+    else:
+        logger.warning("web_search : Aucun résultat web trouvé, empreinte faible")
 
     logger.info(f"web_search : {len(results)} résultats uniques trouvés")
     return results
@@ -306,18 +486,16 @@ async def run_manual_dork(
     browser: Browser | None = None,
     semaphore: asyncio.Semaphore | None = None,
 ) -> list[OsintResult]:
-    """Exécute un unique dork Bing manuel (ex: numéro de téléphone, employeur) hors profil.
+    """Exécute un unique dork manuel (ex: numéro de téléphone, employeur) via SearXNG.
 
-    `browser` et `semaphore` peuvent être partagés par l'orchestrateur (voir
-    run_all_dorks). À défaut, l'appel lance son propre navigateur.
+    `semaphore` peut être partagé par l'orchestrateur (voir run_all_dorks).
+    `browser` est conservé pour rétrocompatibilité de signature mais inutilisé
+    (le canal web ne dépend plus de Playwright).
     """
     semaphore = semaphore or asyncio.Semaphore(1)
     seen_urls: set = set()
     results: list[OsintResult] = []
 
-    async def _runner(active_browser: Browser):
-        await _run_single_dork(semaphore, active_browser, category_key, query, search_id, callback, seen_urls, results)
-
-    await _with_browser(browser, _runner)
+    await _run_single_dork(semaphore, category_key, query, search_id, callback, seen_urls, results)
 
     return results
