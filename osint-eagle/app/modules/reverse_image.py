@@ -71,7 +71,7 @@ async def search_yandex(image_url: str, search_id: str, browser: Browser) -> lis
                 title=item.get("title") or item["href"],
                 url=item["href"],
                 snippet=item.get("snippet"),
-                raw_data={"source_image": image_url, "engine": "yandex"},
+                raw_data={"source_image": image_url, "engine": "yandex", "media_type": "reverse_image"},
                 is_sensitive=True,
             ))
     except (PlaywrightError, asyncio.TimeoutError):
@@ -115,7 +115,7 @@ async def search_google_lens(image_url: str, search_id: str, browser: Browser) -
                 title=item.get("title") or item["href"],
                 url=item["href"],
                 snippet=item.get("snippet"),
-                raw_data={"source_image": image_url, "engine": "google_lens"},
+                raw_data={"source_image": image_url, "engine": "google_lens", "media_type": "reverse_image"},
                 is_sensitive=True,
             ))
     except (PlaywrightError, asyncio.TimeoutError):

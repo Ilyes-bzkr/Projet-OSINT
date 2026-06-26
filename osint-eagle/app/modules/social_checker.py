@@ -61,6 +61,11 @@ _SNIPPET_PRIORITY_FIELDS = (
 _SNIPPET_SKIP_FIELDS = {"image", "avatar", "image_url", "avatar_url"}
 _SNIPPET_MAX_LEN = 300
 
+# Clés possibles, par ordre de priorité, sous lesquelles Maigret expose l'avatar
+# d'un compte dans ids_data. Exclues du snippet (ci-dessus) mais récupérées ici
+# pour l'affichage média côté frontend.
+_AVATAR_FIELDS = ("image", "avatar", "image_url", "avatar_url")
+
 # Logger silencieux passé à Maigret (il exige un logging.Logger standard).
 _maigret_logger = logging.getLogger("maigret")
 _maigret_logger.addHandler(logging.NullHandler())
@@ -108,6 +113,22 @@ async def _get_sites(top: int) -> dict:
     if top not in _sites_cache:
         _sites_cache[top] = _db.ranked_sites_dict(top=top)
     return _sites_cache[top]
+
+
+def _extract_avatar(ids_data: Optional[dict]) -> Optional[str]:
+    """Retourne l'URL d'avatar exposée par Maigret dans ids_data, si présente.
+
+    Ne renvoie qu'une URL http(s) plausible ; tout autre contenu (placeholder,
+    chemin relatif) est ignoré pour ne pas alimenter l'affichage avec une image
+    invalide.
+    """
+    if not ids_data:
+        return None
+    for key in _AVATAR_FIELDS:
+        value = ids_data.get(key)
+        if isinstance(value, str) and value.startswith("http"):
+            return value
+    return None
 
 
 def _build_snippet(ids_data: Optional[dict], tags: Optional[list]) -> Optional[str]:
@@ -185,6 +206,19 @@ async def _scan_username(
         ids_data = getattr(status, "ids_data", None) or {}
         tags = list(getattr(status, "tags", None) or [])
 
+        raw_data = {
+            "platform": site_name,
+            "username": username,
+            "category_platform": tags[0] if tags else None,
+            "tags": tags,
+            "ids_data": ids_data,
+        }
+        # Avatar du compte : exclu du snippet (texte) mais exposé sous une clé
+        # dédiée pour l'affichage média côté frontend, comme github/gravatar.
+        avatar_url = _extract_avatar(ids_data)
+        if avatar_url:
+            raw_data["photo_url"] = avatar_url
+
         result = OsintResult(
             search_id=search_id,
             module=ModuleType.SOCIAL,
@@ -192,13 +226,7 @@ async def _scan_username(
             title=f"{site_name} — @{username}",
             url=url,
             snippet=_build_snippet(ids_data, tags),
-            raw_data={
-                "platform": site_name,
-                "username": username,
-                "category_platform": tags[0] if tags else None,
-                "tags": tags,
-                "ids_data": ids_data,
-            },
+            raw_data=raw_data,
             risk_level=RiskLevel.MEDIUM,
         )
         results.append(result)

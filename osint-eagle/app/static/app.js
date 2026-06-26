@@ -68,6 +68,10 @@ const state = {
   totalResults: 0,
   aiRiskScore: null,
   aiProfile: null,
+  // URLs d'images dont le chargement a échoué : filtrées au rendu pour ne jamais
+  // réafficher une vignette cassée (les avatars de comptes peuvent expirer / être
+  // protégés). Réinitialisé à chaque nouvelle recherche.
+  brokenPhotos: new Set(),
   results: {
     web_search: [], github: [], social: [], breach: [], paste: [],
     photos: [], documents: [], videos: [], accounts: [],
@@ -257,6 +261,53 @@ function handleProgress(msg) {
   updateGlobalProgress();
 }
 
+// Détermine l'URL d'image et la SOURCE d'un résultat, toutes origines confondues.
+// Retourne null si le résultat ne porte pas d'image affichable.
+function extractPhoto(result) {
+  const raw = (result && result.raw_data) || {};
+
+  // GitHub : avatar du profil.
+  if (raw.avatar_url) {
+    return { url: raw.avatar_url, source: "GitHub" };
+  }
+
+  // Reverse image (Yandex / Google Lens) : on affiche l'image recherchée.
+  if (raw.media_type === "reverse_image" && raw.source_image) {
+    const engineLabels = { yandex: "Yandex", google_lens: "Google Lens" };
+    return { url: raw.source_image, source: engineLabels[raw.engine] || "Reverse image" };
+  }
+
+  // Toute autre source exposant une photo : Gravatar (raw.source) ou compte
+  // social Maigret (raw.platform). On retombe sur le module puis un libellé
+  // générique pour rester agnostique si la source n'est pas nommée.
+  if (raw.photo_url) {
+    const source = raw.platform || raw.source || result.module || "Photo";
+    return { url: raw.photo_url, source };
+  }
+
+  return null;
+}
+
+// Collecte (en streaming) l'image d'un résultat dans state.results.photos avec
+// sa source, en dédupliquant par URL, puis met à jour la grille immédiatement.
+function collectPhotoFromResult(result) {
+  const photo = extractPhoto(result);
+  if (!photo || !photo.url) return;
+  if (state.results.photos.some((p) => p.url === photo.url)) return;
+  state.results.photos.push(photo);
+  renderPhotos();
+}
+
+// Marque une image comme cassée (404, expirée, protégée) : elle est retirée de
+// la grille et ne sera plus réaffichée aux rendus suivants.
+function markPhotoBroken(img) {
+  if (img && img.dataset && img.dataset.url) {
+    state.brokenPhotos.add(img.dataset.url);
+  }
+  const item = img && img.closest ? img.closest(".photo-item") : null;
+  if (item) item.remove();
+}
+
 function handleResult(msg) {
   const moduleKey = msg.module;
   const result = msg.data;
@@ -270,12 +321,10 @@ function handleResult(msg) {
     state.results[moduleKey].push(result);
   }
 
-  if (moduleKey === "github" && result.raw_data && result.raw_data.avatar_url) {
-    state.results.photos.push({
-      url: result.raw_data.avatar_url,
-      platform: "GitHub",
-    });
-  }
+  // Collecte des images de TOUTES les sources (GitHub, Gravatar, comptes
+  // sociaux, reverse image...) en streaming : la grille se remplit au fil de
+  // l'eau, indépendamment du module d'origine.
+  collectPhotoFromResult(result);
 
   if (moduleKey === "web_search" && result.category === "document") {
     state.results.documents.push(result);
@@ -372,16 +421,19 @@ function renderResultsScreen() {
 
 function renderPhotos() {
   const grid = $("photos-grid");
-  if (state.results.photos.length === 0) {
+  // On exclut les images déjà signalées cassées pour ne pas les réafficher.
+  const photos = state.results.photos.filter((p) => !state.brokenPhotos.has(p.url));
+  if (photos.length === 0) {
     grid.innerHTML = `<div class="empty-state">👤 Aucune photo trouvée</div>`;
     return;
   }
-  grid.innerHTML = state.results.photos
+  grid.innerHTML = photos
     .map(
       (p) => `
-      <div class="photo-item">
-        <img src="${escapeHtml(p.url)}" alt="avatar" loading="lazy">
-        <span class="photo-badge">${escapeHtml(p.platform)}</span>
+      <div class="photo-item" data-url="${escapeHtml(p.url)}" data-source="${escapeHtml(p.source)}" title="Agrandir">
+        <img src="${escapeHtml(p.url)}" alt="${escapeHtml(p.source)}" loading="lazy"
+             data-url="${escapeHtml(p.url)}" onerror="markPhotoBroken(this)">
+        <span class="photo-badge">${escapeHtml(p.source)}</span>
       </div>`
     )
     .join("");
@@ -517,6 +569,28 @@ function renderDetailsPanel() {
   });
 }
 
+// === LIGHTBOX PHOTO ===
+
+function openLightbox(url, source) {
+  if (!url) return;
+  const overlay = $("lightbox-overlay");
+  const img = $("lightbox-img");
+  const badge = $("lightbox-badge");
+  // Réutilise l'URL (servie depuis le cache navigateur : pas de re-téléchargement).
+  img.src = url;
+  img.alt = source || "";
+  badge.textContent = source || "";
+  overlay.classList.add("open");
+  overlay.setAttribute("aria-hidden", "false");
+}
+
+function closeLightbox() {
+  const overlay = $("lightbox-overlay");
+  if (!overlay.classList.contains("open")) return;
+  overlay.classList.remove("open");
+  overlay.setAttribute("aria-hidden", "true");
+}
+
 // === Cadrage avant-recherche (ancres) ===
 
 function setupScopingToggle() {
@@ -574,6 +648,7 @@ function startSearch(name) {
   state.moduleCounts = {};
   state.aiRiskScore = null;
   state.aiProfile = null;
+  state.brokenPhotos = new Set();
   state.results = {
     web_search: [], github: [], social: [], breach: [], paste: [],
     photos: [], documents: [], videos: [], accounts: [],
@@ -604,4 +679,20 @@ document.addEventListener("DOMContentLoaded", () => {
   $("details-close").addEventListener("click", closeDetailsPanel);
   $("details-overlay").addEventListener("click", closeDetailsPanel);
   $("new-search-btn").addEventListener("click", newSearch);
+
+  // Lightbox photo : délégation sur la grille (rebâtie en streaming), donc un
+  // seul écouteur stable suffit pour toutes les vignettes présentes et futures.
+  $("photos-grid").addEventListener("click", (e) => {
+    const item = e.target.closest(".photo-item");
+    if (!item) return;
+    openLightbox(item.dataset.url, item.dataset.source);
+  });
+  $("lightbox-close").addEventListener("click", closeLightbox);
+  $("lightbox-overlay").addEventListener("click", (e) => {
+    // Ferme seulement si le clic vise le fond, pas l'image ni le contenu.
+    if (e.target === e.currentTarget) closeLightbox();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeLightbox();
+  });
 });

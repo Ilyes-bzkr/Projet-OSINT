@@ -56,7 +56,7 @@ async def check_gravatar(email: str, search_id: str) -> list[OsintResult]:
         title=f"Profil Gravatar : {display_name}" if display_name else "Profil Gravatar",
         url=profile_url or None,
         snippet=about_me[:_SNIPPET_MAX_LEN] if about_me else None,
-        raw_data={"email": email, "photo_url": thumbnail, "display_name": display_name},
+        raw_data={"email": email, "photo_url": thumbnail, "display_name": display_name, "source": "Gravatar"},
         risk_level=RiskLevel.MEDIUM,
         is_sensitive=False,
     )

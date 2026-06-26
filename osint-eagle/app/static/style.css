@@ -588,17 +588,103 @@ a:hover { text-decoration: underline; }
   gap: 12px;
 }
 
-.photo-item { display: flex; flex-direction: column; align-items: center; gap: 6px; width: 70px; }
+.photo-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  width: 96px;
+  cursor: pointer;
+}
+/* Zone carrée fixe qui aligne la grille quel que soit le ratio des images.
+   object-fit: contain montre l'image ENTIÈRE (pas de rognage), centrée sur un
+   fond discret pour les images à transparence. */
 .photo-item img {
-  width: 60px; height: 60px; border-radius: 50%;
-  border: 2px solid var(--primary);
-  object-fit: cover;
+  width: 96px;
+  height: 96px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--secondary);
+  object-fit: contain;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.photo-item:hover img {
+  border-color: var(--primary);
+  box-shadow: 0 0 12px rgba(0, 212, 255, 0.3);
 }
 .photo-item .photo-badge {
   font-size: 0.6rem;
   color: var(--text-secondary);
   font-family: var(--font-data);
+  max-width: 100%;
+  text-align: center;
+  line-height: 1.2;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
+
+/* === LIGHTBOX PHOTO === */
+
+.lightbox-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 48px;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.25s ease;
+  z-index: 300;
+}
+.lightbox-overlay.open { opacity: 1; visibility: visible; }
+
+.lightbox-content {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  max-width: 92vw;
+  max-height: 92vh;
+}
+
+.lightbox-img {
+  max-width: 90vw;
+  max-height: 80vh;
+  object-fit: contain;
+  border: 1px solid var(--primary);
+  border-radius: 8px;
+  background: var(--secondary);
+  box-shadow: 0 0 30px rgba(0, 212, 255, 0.25);
+}
+
+.lightbox-badge {
+  font-family: var(--font-data);
+  font-size: 0.85rem;
+  letter-spacing: 0.5px;
+  color: var(--primary);
+}
+
+.lightbox-close {
+  position: absolute;
+  top: -16px;
+  right: -16px;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--secondary);
+  border: 1px solid var(--primary);
+  color: var(--primary);
+  font-size: 1.05rem;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+.lightbox-close:hover { background: var(--primary); color: #04141c; }
 
 .documents-list, .videos-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
 
