@@ -1,0 +1,46 @@
+# Configuration SearXNG minimale pour OSINT Eagle (usage local).
+# On part des réglages par défaut de SearXNG et on n'override que l'essentiel.
+use_default_settings: true
+
+general:
+  instance_name: "OSINT Eagle Search"
+  # Pas de page de stats/erreurs publiques nécessaire en local.
+  enable_metrics: false
+
+server:
+  # OBLIGATOIRE : clé secrète (n'importe quelle valeur, mais à changer).
+  secret_key: "osint-eagle-local-dev-change-me-please"
+  # Limiter désactivé : pas besoin de Redis/Valkey pour un usage perso local.
+  limiter: false
+  # Pas de proxy d'images : on ne consomme que le JSON.
+  image_proxy: false
+
+search:
+  # 0 = pas de filtrage ; 1 = modéré ; 2 = strict. Raisonnable pour de l'OSINT.
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "all"
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ POINT CRITIQUE : activer le format JSON. Par défaut SearXNG n'expose que  │
+  # │ 'html' et l'API /search?format=json renvoie alors du HTML (erreur n°1).   │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  formats:
+    - html
+    - json
+
+# Moteurs généralistes fiables (redondance = robustesse). On force leur
+# activation ; ce sont ceux interrogés par web_search.py
+# (engines=google,bing,duckduckgo,brave,mojeek).
+engines:
+  - name: google
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: brave
+    disabled: false
+  - name: mojeek
+    disabled: false
+  - name: wikipedia
+    disabled: false

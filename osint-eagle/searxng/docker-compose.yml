@@ -1,0 +1,19 @@
+# SearXNG local pour OSINT Eagle (métamoteur libre, API JSON, sans clé API).
+# Usage PERSONNEL / LOCAL : pas de Redis/Valkey (le limiter ne sert qu'aux
+# instances publiques). Démarre sans aucune dépendance externe.
+#
+# Lancer :   docker compose up -d        (depuis ce dossier searxng/)
+# Arrêter :  docker compose down
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      # hôte 8888 -> conteneur 8080. L'app interroge donc http://localhost:8888
+      - "8888:8080"
+    volumes:
+      # Notre configuration, montée en lecture seule.
+      - ./config:/etc/searxng:ro
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+    restart: unless-stopped
