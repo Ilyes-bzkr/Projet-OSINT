@@ -21,9 +21,9 @@ from playwright.async_api import async_playwright
 from app.ai.analyzer import filter_results
 from app.core.config import settings
 from app.core.logger import logger
-from app.models.result import ModuleType, OsintResult, WebSocketMessage
+from app.models.result import ConfidenceLevel, ModuleType, OsintResult, WebSocketMessage
 from app.models.search import NameProfile, SearchAnchors, SearchRequest
-from app.modules import exif_extractor, gravatar_checker, holehe_checker, reverse_image
+from app.modules import evidence_engine, exif_extractor, gravatar_checker, holehe_checker, reverse_image
 from app.modules.breach_checker import check_breaches
 from app.modules.github_search import search_github
 from app.modules.name_engine import generate_anchored_dorks, generate_search_profile
@@ -144,6 +144,196 @@ async def _dispatch(coro, callback) -> list[OsintResult]:
     return results
 
 
+def _noop_callback(_result: OsintResult) -> None:
+    """Callback neutre : bufferise sans diffuser (les comptes de couche 1A ne sont
+    diffusés qu'APRÈS classification par le moteur de preuves)."""
+    return None
+
+
+def _build_anchor_reference(
+    profile: NameProfile,
+    anchors: Optional[SearchAnchors],
+) -> evidence_engine.ConfirmedReference:
+    """Référence de DÉPART du moteur de preuves : UNIQUEMENT les ancres fournies par
+    l'utilisateur (seuls identifiants fiables d'office). Les profils GitHub n'y
+    entrent PAS automatiquement : ils doivent d'abord prouver leur appartenance."""
+    emails: set[str] = set()
+    usernames: set[str] = set()
+    employer: Optional[str] = None
+    city: Optional[str] = None
+
+    if anchors is not None:
+        if anchors.email:
+            emails.add(anchors.email)
+        if anchors.username:
+            usernames.add(anchors.username.lstrip("@"))
+        employer = anchors.employer
+        city = anchors.city
+
+    return evidence_engine.ConfirmedReference(
+        first_name=profile.first_name,
+        last_name=profile.last_name,
+        full_name=profile.full_name,
+        emails=emails,
+        usernames=usernames,
+        links=set(),
+        employer=employer,
+        city=city,
+    )
+
+
+def _github_account_raw(raw: dict) -> dict:
+    """Adapte un profil GitHub au format attendu par le moteur de preuves."""
+    content = {
+        "fullname": raw.get("name"),
+        "location": raw.get("location"),
+        "occupation": raw.get("company"),
+        "bio": raw.get("bio"),
+        "email": raw.get("email"),
+        "links": [raw["blog"]] if raw.get("blog") else [],
+    }
+    return {
+        "platform": "GitHub",
+        "username": raw.get("login"),
+        "content": {key: value for key, value in content.items() if value},
+        "ids_data": {},
+    }
+
+
+def _github_profile_confidence(
+    raw: dict,
+    anchors: Optional[SearchAnchors],
+    base_reference: evidence_engine.ConfirmedReference,
+) -> tuple[str, list[str]]:
+    """Niveau de confiance d'un profil GitHub.
+
+    GitHub n'est PLUS fiable d'office (search/users renvoie des homonymes). Un
+    profil est "confirmed" UNIQUEMENT s'il matche une ancre utilisateur (pseudo,
+    email, employeur ou ville). Sinon il passe par le MÊME moteur de preuves que
+    les autres comptes (→ corroborated / guessed).
+    """
+    login = raw.get("login") or ""
+    if anchors is not None:
+        if anchors.username and evidence_engine.norm(login) and \
+                evidence_engine.norm(login) == evidence_engine.norm(anchors.username.lstrip("@")):
+            return ConfidenceLevel.CONFIRMED.value, ["login == ancre pseudo"]
+        if anchors.email and raw.get("email") and \
+                evidence_engine.norm_email(raw["email"]) == evidence_engine.norm_email(anchors.email):
+            return ConfidenceLevel.CONFIRMED.value, ["email == ancre email"]
+        if anchors.employer and evidence_engine.loose_contains(raw.get("company"), anchors.employer):
+            return ConfidenceLevel.CONFIRMED.value, [f"employeur == ancre ({anchors.employer})"]
+        if anchors.city and evidence_engine.loose_contains(raw.get("location"), anchors.city):
+            return ConfidenceLevel.CONFIRMED.value, [f"ville == ancre ({anchors.city})"]
+
+    # Aucun match d'ancre direct : on prouve l'appartenance comme une source ordinaire.
+    return evidence_engine.evaluate_account(
+        _github_account_raw(raw), raw.get("bio"), login, base_reference
+    )
+
+
+def _classify_github_results(
+    github_results: list[OsintResult],
+    anchors: Optional[SearchAnchors],
+    base_reference: evidence_engine.ConfirmedReference,
+) -> dict[str, str]:
+    """Classe les profils GitHub (tag raw_data["confidence"]) et logge la
+    répartition. Retourne {login: niveau}."""
+    counts = {
+        ConfidenceLevel.CONFIRMED.value: 0,
+        ConfidenceLevel.CORROBORATED.value: 0,
+        ConfidenceLevel.GUESSED.value: 0,
+    }
+    login_confidence: dict[str, str] = {}
+
+    # Niveau calculé sur les entrées "profil" (celles portant un avatar).
+    for result in github_results:
+        raw = result.raw_data or {}
+        login = raw.get("login")
+        if not login or not raw.get("avatar_url") or login in login_confidence:
+            continue
+        level, reasons = _github_profile_confidence(raw, anchors, base_reference)
+        login_confidence[login] = level
+        counts[level] = counts.get(level, 0) + 1
+        proof = f" — preuves : {'; '.join(reasons)}" if reasons else ""
+        logger.info(f"[evidence] GitHub @{login} → {level}{proof}")
+
+    # Propagation à tous les résultats partageant ce login (emails profil / commit).
+    for result in github_results:
+        raw = result.raw_data or {}
+        login = raw.get("login")
+        if login and login in login_confidence:
+            raw["confidence"] = login_confidence[login]
+
+    if login_confidence:
+        logger.info(
+            f"[evidence] GitHub : {counts[ConfidenceLevel.CONFIRMED.value]} confirmed, "
+            f"{counts[ConfidenceLevel.CORROBORATED.value]} corroborated, "
+            f"{counts[ConfidenceLevel.GUESSED.value]} guessed"
+        )
+    return login_confidence
+
+
+def _augment_reference_with_confirmed_github(
+    reference: evidence_engine.ConfirmedReference,
+    github_results: list[OsintResult],
+    login_confidence: dict[str, str],
+) -> None:
+    """Ajoute à la référence les identifiants des profils GitHub CONFIRMÉS seulement.
+
+    Les emails/usernames de profils GitHub non confirmés (corroborated/guessed) ne
+    doivent JAMAIS servir de référence : ils contamineraient la corroboration des
+    autres comptes.
+    """
+    for result in github_results:
+        raw = result.raw_data or {}
+        login = raw.get("login")
+        if not login or login_confidence.get(login) != ConfidenceLevel.CONFIRMED.value:
+            continue
+        reference.usernames.add(login)
+        if raw.get("email"):
+            reference.emails.add(raw["email"])
+        if raw.get("blog"):
+            reference.links.add(raw["blog"])
+        if result.url:
+            reference.links.add(result.url)
+
+
+def _classify_social_accounts(
+    social_results: list[OsintResult],
+    reference: evidence_engine.ConfirmedReference,
+) -> set[str]:
+    """Étiquette chaque compte social deviné (raw_data["confidence"]) via le moteur
+    de preuves, logge la répartition et la/les preuve(s), et retourne l'ensemble
+    des usernames promus 'corroborated'.
+    """
+    counts = {
+        ConfidenceLevel.CONFIRMED.value: 0,
+        ConfidenceLevel.CORROBORATED.value: 0,
+        ConfidenceLevel.GUESSED.value: 0,
+    }
+    corroborated: set[str] = set()
+
+    for result in social_results:
+        raw = result.raw_data or {}
+        username = raw.get("username") or ""
+        level, reasons = evidence_engine.evaluate_account(raw, result.snippet, username, reference)
+        raw["confidence"] = level
+        if reasons:
+            raw["confidence_evidence"] = reasons
+        counts[level] = counts.get(level, 0) + 1
+        proof = f" — preuves : {'; '.join(reasons)}" if reasons else ""
+        logger.info(f"[evidence] {raw.get('platform') or '?'} @{username} → {level}{proof}")
+        if level == ConfidenceLevel.CORROBORATED.value:
+            corroborated.add(username)
+
+    logger.info(
+        f"[evidence] Couche 1A : {counts[ConfidenceLevel.CONFIRMED.value]} confirmed, "
+        f"{counts[ConfidenceLevel.CORROBORATED.value]} corroborated, "
+        f"{counts[ConfidenceLevel.GUESSED.value]} guessed"
+    )
+    return corroborated
+
+
 def _clean_json_text(raw_text: str) -> str:
     text = raw_text.strip()
     if text.startswith("```"):
@@ -239,14 +429,30 @@ async def run_layer1(
     for module_name in ("social", "github", "paste"):
         await send_progress(websocket, search_id, module_name, "running", f"Module {module_name} en cours...", 12)
 
+    # Les comptes sociaux de couche 1A viennent d'usernames DEVINÉS : on ne les
+    # diffuse pas immédiatement. On les bufferise (callback neutre), on les classe
+    # par niveau de confiance (moteur de preuves, qui a besoin du résultat GitHub),
+    # puis on les diffuse étiquetés. github/paste continuent de streamer en direct.
     social_results, github_results, paste_results = await asyncio.gather(
         _safe_run(
-            check_all_platforms(profile, search_id, callback, max_variants=_LAYER1_SOCIAL_VARIANTS),
+            check_all_platforms(profile, search_id, _noop_callback, max_variants=_LAYER1_SOCIAL_VARIANTS),
             "social",
         ),
         _safe_run(search_github(profile, search_id, callback), "github"),
         _safe_run(search_pastes(profile, search_id, callback), "paste"),
     )
+
+    # Classification : confirmed / corroborated / guessed (élimination des homonymes).
+    # Référence = ancres uniquement, puis enrichie des SEULS profils GitHub confirmés
+    # (GitHub n'est pas fiable d'office : il prouve son appartenance comme les autres).
+    reference = _build_anchor_reference(profile, anchors)
+    github_login_confidence = _classify_github_results(github_results, anchors, reference)
+    _augment_reference_with_confirmed_github(reference, github_results, github_login_confidence)
+    corroborated_usernames = _classify_social_accounts(social_results, reference)
+
+    # Diffusion (et persistance) des comptes désormais étiquetés.
+    for result in social_results:
+        callback(result)
 
     for module_name in ("social", "github", "paste"):
         await send_progress(websocket, search_id, module_name, "completed", f"Module {module_name} terminé", 100)
@@ -280,6 +486,12 @@ async def run_layer1(
     # (le scraping web et les pastes renvoient souvent des pages hors-sujet).
     anchored_results = await filter_results(results_l1, profile, search_id, anchors=anchors)
     identifiers = await _extract_identifiers(anchored_results, profile, search_id)
+
+    # Seuls les usernames FIABLES alimenteront la couche 2 : confirmés (GitHub /
+    # ancre) et corroborés par preuve. Les "guessed" (homonymes) sont exclus de
+    # tout approfondissement — ils ne servent QU'À l'affichage en section séparée.
+    identifiers["confirmed_social_usernames"] = sorted(reference.usernames)
+    identifiers["corroborated_social_usernames"] = sorted(corroborated_usernames)
 
     return results_l1, identifiers
 
@@ -393,25 +605,26 @@ async def run_layer2(
     from app.api.websocket import send_progress
 
     emails = list(identifiers.get("emails") or [])
-    usernames = [u.get("value") for u in identifiers.get("usernames_confirmed") or [] if u.get("value")]
     phones = identifiers.get("phone_numbers") or []
     photos = identifiers.get("photo_urls") or []
     videos = identifiers.get("video_urls") or []
+
+    # Usernames sociaux FIABLES uniquement (classés en couche 1) : confirmés
+    # (GitHub / ancre) et corroborés par preuve. Les comptes "guessed" (homonymes
+    # potentiels) ne déclenchent AUCUNE recherche de couche 2.
+    confirmed_social = list(identifiers.get("confirmed_social_usernames") or [])
+    corroborated_social = list(identifiers.get("corroborated_social_usernames") or [])
 
     # Villes / employeurs : on combine ceux extraits par l'IA et ceux fournis en ancre.
     cities = [identifiers["city"]] if identifiers.get("city") else []
     employers = [identifiers["employer"]] if identifiers.get("employer") else []
 
     # === Pré-remplissage par les ancres (Levier 1) ===
+    # NB : l'ancre username est déjà intégrée aux usernames confirmés en couche 1.
     if anchors is not None:
         if anchors.email and anchors.email.lower() not in {e.lower() for e in emails}:
             emails.append(anchors.email)
             logger.info(f"[intelligence_engine] Couche 2 : email ancre injecté ({anchors.email})")
-        if anchors.username:
-            anchor_user = anchors.username.lstrip("@")
-            if anchor_user and anchor_user.lower() not in {u.lstrip("@").lower() for u in usernames}:
-                usernames.append(anchor_user)
-                logger.info(f"[intelligence_engine] Couche 2 : pseudo ancre injecté ({anchor_user})")
         if anchors.city and anchors.city.lower() not in {c.lower() for c in cities}:
             cities.append(anchors.city)
         if anchors.employer and anchors.employer.lower() not in {e.lower() for e in employers}:
@@ -419,7 +632,8 @@ async def run_layer2(
 
     await send_progress(
         websocket, search_id, "intelligence_engine", "running",
-        f"Couche 2 : {len(emails)} email(s), {len(usernames)} username(s), "
+        f"Couche 2 : {len(emails)} email(s), "
+        f"{len(confirmed_social) + len(corroborated_social)} username(s) fiable(s), "
         f"{len(photos)} photo(s), {len(videos)} vidéo(s) à approfondir...", 45,
     )
 
@@ -430,18 +644,28 @@ async def run_layer2(
         tasks.append(_safe_run(_dispatch(gravatar_checker.check_gravatar(email, search_id), callback), "gravatar"))
         tasks.append(_safe_run(check_breaches([email], [], search_id, callback), "breach"))
 
-    # Un SEUL appel Maigret pour la couche 2 : au plus _LAYER2_MAX_SOCIAL_USERNAMES
-    # usernames (les plus pertinents en tête de liste), scannés en série en interne,
-    # sur top _LAYER2_SOCIAL_TOP_SITES. Remplace l'ancien lancement d'un scan
-    # Maigret par username (jusqu'à dix en parallèle).
-    social_usernames = usernames[:_LAYER2_MAX_SOCIAL_USERNAMES]
-    if social_usernames:
+    # Approfondissement social sur usernames FIABLES uniquement : confirmés d'abord,
+    # puis corroborés, dans la limite de _LAYER2_MAX_SOCIAL_USERNAMES au total.
+    # Chaque compte trouvé hérite du niveau de confiance de l'username scanné.
+    take_confirmed = confirmed_social[:_LAYER2_MAX_SOCIAL_USERNAMES]
+    take_corroborated = corroborated_social[: max(0, _LAYER2_MAX_SOCIAL_USERNAMES - len(take_confirmed))]
+    if take_confirmed:
         tasks.append(_safe_run(
             check_all_platforms(
                 profile, search_id, callback,
-                usernames=social_usernames, top_sites=_LAYER2_SOCIAL_TOP_SITES,
+                usernames=take_confirmed, top_sites=_LAYER2_SOCIAL_TOP_SITES,
+                confidence=ConfidenceLevel.CONFIRMED.value,
             ),
-            "social_username",
+            "social_confirmed",
+        ))
+    if take_corroborated:
+        tasks.append(_safe_run(
+            check_all_platforms(
+                profile, search_id, callback,
+                usernames=take_corroborated, top_sites=_LAYER2_SOCIAL_TOP_SITES,
+                confidence=ConfidenceLevel.CORROBORATED.value,
+            ),
+            "social_corroborated",
         ))
 
     for phone in phones:

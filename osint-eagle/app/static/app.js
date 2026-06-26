@@ -481,38 +481,70 @@ function renderVideos() {
     .join("");
 }
 
+// Niveau de confiance d'un compte. Défaut "confirmed" : un compte sans étiquette
+// (legacy / module non social) reste dans la liste principale, jamais masqué.
+function accountConfidence(a) {
+  return (a.raw_data && a.raw_data.confidence) || "confirmed";
+}
+
+function renderAccountRow(a, unverified) {
+  const raw = a.raw_data || {};
+  const emoji = PLATFORM_EMOJI[raw.platform] || "🔗";
+  let badge = "";
+  if (unverified) {
+    badge = `<span class="account-badge account-badge-unverified">non vérifié</span>`;
+  } else if (accountConfidence(a) === "corroborated") {
+    badge = `<span class="account-badge account-badge-corroborated">corroboré</span>`;
+  }
+  // data-platform / data-username : prépare un futur bouton « Enquêter ».
+  return `
+    <div class="account-item${unverified ? " unverified" : ""}" data-platform="${escapeHtml(raw.platform || "")}" data-username="${escapeHtml(raw.username || "")}">
+      <span class="account-emoji">${emoji}</span>
+      <span class="account-label">${escapeHtml(raw.platform)} — @${escapeHtml(raw.username)}</span>
+      ${badge}
+      ${a.url ? `<a href="${escapeHtml(a.url)}" target="_blank" rel="noopener">↗</a>` : ""}
+    </div>`;
+}
+
 function renderAccounts() {
   const container = $("accounts-list");
-  if (state.results.accounts.length === 0) {
+  const all = state.results.accounts;
+  if (all.length === 0) {
     container.innerHTML = `<div class="empty-state">🔍 Aucun compte trouvé</div>`;
     return;
   }
 
+  const verified = all.filter((a) => accountConfidence(a) !== "guessed");
+  const guessed = all.filter((a) => accountConfidence(a) === "guessed");
+
+  // Comptes vérifiés (confirmés / corroborés) groupés par catégorie de plateforme.
   const groups = {};
-  state.results.accounts.forEach((a) => {
+  verified.forEach((a) => {
     const raw = a.raw_data || {};
     const groupKey = CATEGORY_GROUP_LABELS[raw.category_platform] || "Autres";
     if (!groups[groupKey]) groups[groupKey] = [];
     groups[groupKey].push(a);
   });
 
-  container.innerHTML = Object.entries(groups)
+  let html = Object.entries(groups)
     .map(([groupName, items]) => {
-      const rows = items
-        .map((a) => {
-          const raw = a.raw_data || {};
-          const emoji = PLATFORM_EMOJI[raw.platform] || "🔗";
-          return `
-          <div class="account-item">
-            <span class="account-emoji">${emoji}</span>
-            <span>${escapeHtml(raw.platform)} — @${escapeHtml(raw.username)}</span>
-            <a href="${escapeHtml(a.url)}" target="_blank" rel="noopener">↗</a>
-          </div>`;
-        })
-        .join("");
+      const rows = items.map((a) => renderAccountRow(a, false)).join("");
       return `<div class="account-group"><h5>${escapeHtml(groupName)}</h5>${rows}</div>`;
     })
     .join("");
+
+  // Section SÉPARÉE : comptes au même nom non vérifiés (homonymes possibles).
+  if (guessed.length) {
+    const rows = guessed.map((a) => renderAccountRow(a, true)).join("");
+    html += `
+      <div class="account-group accounts-unverified" data-section="unverified">
+        <h5>⚠️ Comptes au même nom (non vérifiés) — ${guessed.length}</h5>
+        <p class="unverified-hint">Existence confirmée, mais aucun lien prouvé avec la cible — possibles homonymes.</p>
+        ${rows}
+      </div>`;
+  }
+
+  container.innerHTML = html || `<div class="empty-state">🔍 Aucun compte trouvé</div>`;
 }
 
 // === PANNEAU DÉTAILS ===

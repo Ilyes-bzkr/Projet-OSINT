@@ -11,7 +11,7 @@ from anthropic import AsyncAnthropic
 
 from app.core.config import settings
 from app.core.logger import logger
-from app.models.result import OsintResult
+from app.models.result import ConfidenceLevel, OsintResult
 from app.models.search import NameProfile
 
 _MODEL = "claude-sonnet-4-6"
@@ -116,6 +116,9 @@ _PROFILE_SCHEMA = """{
       "social_footprint": int
     }
   },
+  "unverified_namesakes": [
+    {"platform": str, "username": str, "url": str ou null, "note": str}
+  ],
   "summary": str,
   "confidence_overall": "high"|"medium"|"low",
   "data_freshness": str
@@ -147,12 +150,40 @@ def _group_by_module(results: list[OsintResult]) -> dict[str, list[dict]]:
     return grouped
 
 
+def _is_guessed(result: OsintResult) -> bool:
+    """Compte au même nom NON vérifié (homonyme possible) à exclure du profil principal."""
+    return (result.raw_data or {}).get("confidence") == ConfidenceLevel.GUESSED.value
+
+
+def _namesake_payload(result: OsintResult) -> dict:
+    raw = result.raw_data or {}
+    return {
+        "platform": raw.get("platform") or _domain_of(result.url),
+        "username": raw.get("username") or raw.get("login") or "",
+        "url": result.url,
+        "note": "non vérifié",
+    }
+
+
 def _build_user_prompt(profile: NameProfile, results: list[OsintResult]) -> str:
-    grouped = _group_by_module(results)
-    data_str = json.dumps(grouped, ensure_ascii=False)
+    # Le profil principal ne se construit QUE sur les données confirmées/corroborées ;
+    # les comptes "guessed" sont isolés pour ne pas contaminer l'identité.
+    main = [r for r in results if not _is_guessed(r)]
+    guessed = [r for r in results if _is_guessed(r)]
+
+    data_str = json.dumps(_group_by_module(main), ensure_ascii=False)
+    namesakes_str = json.dumps([_namesake_payload(r) for r in guessed], ensure_ascii=False)
+
     return (
         f"Construis une fiche de renseignement complète pour :\n{profile.full_name}\n\n"
-        f"Données collectées ({len(results)} sources) :\n{data_str}\n\n"
+        f"Données CONFIRMÉES / CORROBORÉES ({len(main)} sources) :\n{data_str}\n\n"
+        f"Comptes au même nom NON VÉRIFIÉS (homonymes possibles, {len(guessed)}) :\n{namesakes_str}\n\n"
+        "RÈGLES IMPÉRATIVES :\n"
+        "- Construis TOUT le profil principal (identité, localisation, contact, "
+        "professionnel, activités, réseau, etc.) UNIQUEMENT à partir des données "
+        "confirmées/corroborées.\n"
+        "- N'utilise JAMAIS les comptes non vérifiés comme des faits sur la cible : "
+        "recopie-les tels quels dans le champ 'unverified_namesakes' et nulle part ailleurs.\n\n"
         f"Génère un JSON avec cette structure exacte :\n\n{_PROFILE_SCHEMA}"
     )
 
@@ -236,8 +267,14 @@ def _minimal_fallback_profile(profile: NameProfile, results: list[OsintResult]) 
     usernames = []
     platforms = set()
     breaches = []
+    namesakes = []
     for result in results:
         raw = result.raw_data or {}
+        # Comptes non vérifiés : isolés, jamais mêlés à l'identité principale.
+        if _is_guessed(result):
+            if raw.get("platform") or result.url:
+                namesakes.append(_namesake_payload(result))
+            continue
         if raw.get("email"):
             emails.append({"value": raw["email"], "source": result.module.value, "leaked": result.module.value == "breach"})
         if raw.get("username") and raw.get("platform"):
@@ -287,6 +324,7 @@ def _minimal_fallback_profile(profile: NameProfile, results: list[OsintResult]) 
                 "professional_info_exposed": 10, "breach_exposure": 10, "social_footprint": 10,
             },
         },
+        "unverified_namesakes": namesakes,
         "summary": "Profil minimal généré automatiquement (analyse IA indisponible).",
         "confidence_overall": "low",
         "data_freshness": "inconnu",

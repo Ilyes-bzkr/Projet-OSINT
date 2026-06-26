@@ -10,8 +10,11 @@ from anthropic import APITimeoutError, AsyncAnthropic
 
 from app.core.config import settings
 from app.core.logger import logger
-from app.models.result import OsintResult, ResultCategory, RiskLevel
+from app.models.result import ConfidenceLevel, OsintResult, ResultCategory, RiskLevel
 from app.models.search import NameProfile, SearchAnchors
+
+# Niveaux de confiance d'un compte social considérés comme appartenant à la cible.
+_TRUSTED_CONFIDENCE = {ConfidenceLevel.CONFIRMED.value, ConfidenceLevel.CORROBORATED.value}
 
 _MODEL = "claude-sonnet-4-6"
 _MAX_TOKENS = 4000
@@ -27,15 +30,18 @@ _SYSTEM_PROMPT = (
 
 
 def _is_always_kept(result: OsintResult) -> bool:
-    """Les fuites de données et résultats critiques ne sont jamais filtrés."""
-    return result.category == ResultCategory.BREACH or result.risk_level == RiskLevel.CRITICAL
+    """Jamais filtrés : fuites de données, résultats critiques, et comptes (sociaux
+    ou GitHub) dont l'appartenance à la cible est établie (confirmed / corroborated)."""
+    if result.category == ResultCategory.BREACH or result.risk_level == RiskLevel.CRITICAL:
+        return True
+    return (result.raw_data or {}).get("confidence") in _TRUSTED_CONFIDENCE
 
 
 def _result_to_payload(result: OsintResult) -> dict:
     snippet = result.snippet or ""
     if len(snippet) > _SNIPPET_MAX_LEN:
         snippet = snippet[:_SNIPPET_MAX_LEN]
-    return {
+    payload = {
         "id": result.id,
         "title": result.title,
         "url": result.url,
@@ -43,6 +49,11 @@ def _result_to_payload(result: OsintResult) -> dict:
         "module": result.module.value,
         "category": result.category.value,
     }
+    # Niveau de confiance d'appartenance (comptes sociaux / GitHub) : guide le scepticisme.
+    confidence = (result.raw_data or {}).get("confidence")
+    if confidence:
+        payload["confidence"] = confidence
+    return payload
 
 
 def _build_user_prompt(
@@ -74,6 +85,12 @@ def _build_user_prompt(
         f"Variantes connues : {', '.join(profile.full_variants)}\n"
         f"Informations contextuelles disponibles : {contexte_connu or 'Aucune'}\n\n"
         f"{anchors_block}"
+        "Niveau de confiance des comptes (sociaux et GitHub) — champ 'confidence', si présent :\n"
+        "- 'confirmed' / 'corroborated' : appartenance à la cible ÉTABLIE → score élevé, "
+        "traite-le comme un fait sur la cible.\n"
+        "- 'guessed' : compte au même nom NON vérifié (homonyme probable) → score bas "
+        "(0.0-0.3) sauf si d'autres éléments du résultat le rattachent clairement à la "
+        "cible. Ne l'utilise jamais comme un fait certain.\n\n"
         "Pour chaque résultat ci-dessous, donne un score de 0.0 à 1.0 "
         "indiquant la probabilité que ce résultat concerne la cible.\n\n"
         "Critères :\n"

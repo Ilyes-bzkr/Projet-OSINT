@@ -37,6 +37,21 @@ class RiskLevel(str, Enum):
     CRITICAL = "critical"
 
 
+class ConfidenceLevel(str, Enum):
+    """Niveau de confiance d'appartenance d'un compte à la cible.
+
+    - CONFIRMED    : appartient certainement à la cible (ancre / profil GitHub trouvé).
+    - CORROBORATED : compte deviné, mais prouvé par le moteur de preuves
+                     (1 preuve forte ou 2 preuves moyennes le reliant à un
+                     identifiant confirmé).
+    - GUESSED      : existence confirmée par Maigret mais AUCUNE preuve
+                     d'appartenance — c'est là que tombent les homonymes.
+    """
+    CONFIRMED = "confirmed"
+    CORROBORATED = "corroborated"
+    GUESSED = "guessed"
+
+
 class OsintResult(BaseModel):
     """Un résultat OSINT unique."""
     id: str = Field(default_factory=lambda: str(__import__('uuid').uuid4()))

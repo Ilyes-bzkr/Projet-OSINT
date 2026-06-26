@@ -14,7 +14,7 @@ import logging
 from typing import Callable, Optional
 
 from app.core.logger import logger
-from app.models.result import ModuleType, OsintResult, ResultCategory, RiskLevel
+from app.models.result import ConfidenceLevel, ModuleType, OsintResult, ResultCategory, RiskLevel
 from app.models.search import NameProfile
 
 try:
@@ -65,6 +65,15 @@ _SNIPPET_MAX_LEN = 300
 # d'un compte dans ids_data. Exclues du snippet (ci-dessus) mais récupérées ici
 # pour l'affichage média côté frontend.
 _AVATAR_FIELDS = ("image", "avatar", "image_url", "avatar_url")
+
+# Clés d'ids_data agrégées en métadonnées de contenu STRUCTURÉES, exposées pour
+# le moteur de preuves (corroboration des comptes devinés). Par champ logique,
+# première clé non vide retenue.
+_CONTENT_FULLNAME_KEYS = ("fullname", "full_name", "name", "displayed_name", "display_name", "real_name")
+_CONTENT_LOCATION_KEYS = ("location", "city", "country", "region", "place", "address")
+_CONTENT_OCCUPATION_KEYS = ("occupation", "job", "job_title", "company", "employer", "organization", "works_at")
+_CONTENT_BIO_KEYS = ("bio", "description", "about", "summary", "headline", "status")
+_CONTENT_EMAIL_KEYS = ("email", "email_address", "public_email", "contact_email")
 
 # Logger silencieux passé à Maigret (il exige un logging.Logger standard).
 _maigret_logger = logging.getLogger("maigret")
@@ -131,6 +140,40 @@ def _extract_avatar(ids_data: Optional[dict]) -> Optional[str]:
     return None
 
 
+def _extract_content(ids_data: Optional[dict]) -> dict:
+    """Extrait des métadonnées de contenu STRUCTURÉES depuis ids_data Maigret.
+
+    Sert de matière au moteur de preuves (corroboration). N'expose que les champs
+    réellement présents ; retourne {} si rien d'exploitable.
+    """
+    if not ids_data:
+        return {}
+
+    def _first(keys: tuple) -> Optional[str]:
+        for key in keys:
+            value = ids_data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    # Liens exposés par le compte (hors avatar) : utiles aux preuves de lien croisé.
+    links = [
+        value
+        for key, value in ids_data.items()
+        if key not in _AVATAR_FIELDS and isinstance(value, str) and value.startswith("http")
+    ]
+
+    content = {
+        "fullname": _first(_CONTENT_FULLNAME_KEYS),
+        "location": _first(_CONTENT_LOCATION_KEYS),
+        "occupation": _first(_CONTENT_OCCUPATION_KEYS),
+        "bio": _first(_CONTENT_BIO_KEYS),
+        "email": _first(_CONTENT_EMAIL_KEYS),
+        "links": links,
+    }
+    return {key: value for key, value in content.items() if value}
+
+
 def _build_snippet(ids_data: Optional[dict], tags: Optional[list]) -> Optional[str]:
     """Concatène les métadonnées exposées par Maigret pour aider le filtrage IA.
 
@@ -160,8 +203,13 @@ async def _scan_username(
     callback: Callable,
     results: list[OsintResult],
     top: int,
+    confidence: str,
 ) -> None:
     """Scanne un username avec Maigret et n'émet que les comptes CLAIMED.
+
+    Chaque compte produit porte raw_data["confidence"] = `confidence` (étiquette
+    fournie par l'appelant ; la promotion guessed→corroborated est faite par
+    l'orchestrateur, pas ici).
 
     Le scan réseau est plafonné par le sémaphore global (jamais plus de
     _GLOBAL_MAX_CONCURRENT_SCANS scans Maigret en parallèle sur la recherche).
@@ -212,12 +260,18 @@ async def _scan_username(
             "category_platform": tags[0] if tags else None,
             "tags": tags,
             "ids_data": ids_data,
+            "confidence": confidence,
         }
         # Avatar du compte : exclu du snippet (texte) mais exposé sous une clé
         # dédiée pour l'affichage média côté frontend, comme github/gravatar.
         avatar_url = _extract_avatar(ids_data)
         if avatar_url:
             raw_data["photo_url"] = avatar_url
+        # Contenu structuré (nom affiché, localisation, métier, bio, email, liens)
+        # exposé pour le moteur de preuves de l'orchestrateur.
+        content = _extract_content(ids_data)
+        if content:
+            raw_data["content"] = content
 
         result = OsintResult(
             search_id=search_id,
@@ -247,6 +301,7 @@ async def check_all_platforms(
     username_override: str | None = None,
     usernames: list[str] | None = None,
     top_sites: int | None = None,
+    confidence: str = ConfidenceLevel.GUESSED.value,
 ) -> list[OsintResult]:
     """Vérifie l'existence de comptes sociaux via Maigret.
 
@@ -258,6 +313,10 @@ async def check_all_platforms(
 
     top_sites permet de restreindre le nombre de sites scannés (défaut couche 1 :
     _TOP_SITES_DEFAULT ; la couche 2 passe une valeur plus basse pour aller vite).
+
+    confidence : niveau de confiance attaché à chaque compte produit. Par défaut
+    "guessed" (usernames devinés de couche 1A) ; l'appelant passe "confirmed"
+    quand il scanne un username certain (ancre / GitHub).
     """
     if not _MAIGRET_AVAILABLE:
         logger.error(
@@ -291,7 +350,7 @@ async def check_all_platforms(
 
     async def _guarded(u: str) -> None:
         async with semaphore:
-            await _scan_username(u, search_id, callback, results, top)
+            await _scan_username(u, search_id, callback, results, top, confidence)
 
     logger.info(
         f"social_checker : scan Maigret de {len(targets)} username(s) sur les "

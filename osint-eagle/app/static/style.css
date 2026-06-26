@@ -722,7 +722,44 @@ a:hover { text-decoration: underline; }
   font-size: 0.85rem;
 }
 .account-item .account-emoji { font-size: 1rem; }
+.account-item .account-label { flex: 1; min-width: 0; }
 .account-item a { font-family: var(--font-data); }
+
+.account-badge {
+  font-family: var(--font-data);
+  font-size: 0.6rem;
+  padding: 2px 7px;
+  border-radius: 4px;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+.account-badge-corroborated {
+  color: var(--medium);
+  background: rgba(245, 197, 24, 0.12);
+  border: 1px solid rgba(245, 197, 24, 0.4);
+}
+.account-badge-unverified {
+  color: var(--warning);
+  background: rgba(255, 140, 0, 0.12);
+  border: 1px solid rgba(255, 140, 0, 0.45);
+}
+
+/* Section séparée des comptes au même nom non vérifiés (homonymes possibles). */
+.accounts-unverified {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed rgba(255, 140, 0, 0.4);
+}
+.accounts-unverified h5 { color: var(--warning); }
+.unverified-hint {
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+  line-height: 1.4;
+  margin: 0 0 8px;
+  opacity: 0.85;
+}
+.account-item.unverified { opacity: 0.72; transition: opacity 0.2s ease; }
+.account-item.unverified:hover { opacity: 1; }
 
 .results-right { background: rgba(8, 10, 15, 0.4); }
 
