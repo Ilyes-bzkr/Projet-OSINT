@@ -24,6 +24,7 @@ from app.core.logger import logger
 from app.models.result import ConfidenceLevel, ModuleType, OsintResult, WebSocketMessage
 from app.models.search import NameProfile, SearchAnchors, SearchRequest
 from app.modules import evidence_engine, exif_extractor, gravatar_checker, holehe_checker, reverse_image
+from app.modules.account_enricher import enrich_accounts
 from app.modules.breach_checker import check_breaches
 from app.modules.github_search import search_github
 from app.modules.name_engine import generate_anchored_dorks, generate_search_profile
@@ -334,6 +335,96 @@ def _classify_social_accounts(
     return corroborated
 
 
+def _run_convergence(
+    social_results: list[OsintResult],
+    github_results: list[OsintResult],
+    github_login_confidence: dict[str, str],
+    profile: NameProfile,
+) -> set[str]:
+    """Convergence inter-comptes (Piste A) : promeut des clusters de comptes guessed
+    cohérents en corroborated. Réécrit raw_data["confidence"] des comptes promus et
+    retourne l'ensemble des USERNAMES sociaux promus (pour la couche 2).
+
+    GitHub guessed participe comme les autres (jamais promu du seul fait d'être
+    GitHub — il suit les mêmes règles). Aucune promotion en confirmed.
+    """
+    guessed = ConfidenceLevel.GUESSED.value
+    descriptors: list[dict] = []
+    social_by_key: dict[str, OsintResult] = {}
+
+    for idx, result in enumerate(social_results):
+        raw = result.raw_data or {}
+        username = raw.get("username")
+        if raw.get("confidence") != guessed or not username:
+            continue
+        key = f"s{idx}"
+        descriptors.append({
+            "key": key, "username": username,
+            "content": evidence_engine.account_content_view(raw),
+            "first_name": profile.first_name, "last_name": profile.last_name,
+        })
+        social_by_key[key] = result
+
+    seen_logins: set[str] = set()
+    for result in github_results:
+        raw = result.raw_data or {}
+        login = raw.get("login")
+        if not login or login in seen_logins:
+            continue
+        if github_login_confidence.get(login) != guessed:
+            continue
+        seen_logins.add(login)
+        descriptors.append({
+            "key": f"g{login}", "username": login,
+            "content": evidence_engine.account_content_view(raw),
+            "first_name": profile.first_name, "last_name": profile.last_name,
+        })
+
+    if len(descriptors) < 2:
+        return set()
+
+    clusters = evidence_engine.converge_accounts(descriptors)
+
+    promoted_social: set[str] = set()
+    promoted_logins: set[str] = set()
+    for cluster in clusters:
+        members = cluster["members"]
+        decision = "promu corroborated" if cluster["promoted"] else "laissé guessed"
+        logger.info(
+            f"[convergence] cluster {members} | signaux : {cluster['signals'] or ['aucun']} | {decision}"
+        )
+        if not cluster["promoted"]:
+            continue
+        for key in members:
+            if key.startswith("s"):
+                result = social_by_key.get(key)
+                if result is None:
+                    continue
+                result.raw_data["confidence"] = ConfidenceLevel.CORROBORATED.value
+                result.raw_data.setdefault("confidence_evidence", []).append(
+                    "convergence : " + ", ".join(cluster["signals"])
+                )
+                if result.raw_data.get("username"):
+                    promoted_social.add(result.raw_data["username"])
+            elif key.startswith("g"):
+                promoted_logins.add(key[1:])
+
+    # Propage la promotion GitHub à toutes les entrées partageant un login promu.
+    if promoted_logins:
+        for result in github_results:
+            raw = result.raw_data or {}
+            if raw.get("login") in promoted_logins:
+                raw["confidence"] = ConfidenceLevel.CORROBORATED.value
+                raw.setdefault("confidence_evidence", []).append("convergence inter-comptes")
+        logger.info(f"[convergence] GitHub promus corroborated : {sorted(promoted_logins)}")
+
+    logger.info(
+        f"[convergence] {len(promoted_social)} compte(s) social/aux promu(s), "
+        f"{len(promoted_logins)} profil(s) GitHub promu(s)"
+    )
+    return promoted_social
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DIAGNOSTIC TEMPORAIRE [DIAG-ATTR] — mesure la richesse RÉELLE des attributs des
 # comptes évalués en couche 1A (combien portent fullname/ville/bio/occupation/
@@ -558,29 +649,19 @@ async def run_layer1(
         _safe_run(search_pastes(profile, search_id, callback), "paste"),
     )
 
-    # Classification : confirmed / corroborated / guessed (élimination des homonymes).
-    # Référence = ancres uniquement, puis enrichie des SEULS profils GitHub confirmés
-    # (GitHub n'est pas fiable d'office : il prouve son appartenance comme les autres).
+    # Référence de preuves = ancres uniquement, puis enrichie des SEULS profils
+    # GitHub confirmés (GitHub n'est pas fiable d'office : il prouve son
+    # appartenance comme les autres). La classification des comptes SOCIAUX est
+    # repoussée APRÈS enrichissement + web_search (voir plus bas) pour que cette
+    # matière nourrisse réellement la corroboration. La classification GitHub
+    # reste ICI, inchangée (préserve le correctif écart #1).
     reference = _build_anchor_reference(profile, anchors)
     github_login_confidence = _classify_github_results(github_results, anchors, reference)
     _augment_reference_with_confirmed_github(reference, github_results, github_login_confidence)
-    corroborated_usernames = _classify_social_accounts(social_results, reference)
 
-    # DIAGNOSTIC TEMPORAIRE [DIAG-ATTR] : mesure la richesse des attributs des
-    # comptes (à retirer une fois les chiffres lus). N'altère aucune décision ;
-    # isolé en try/except pour ne jamais casser le pipeline.
-    try:
-        _diag_log_account_attributes(social_results, github_results)
-    except Exception as e:
-        logger.warning(f"[DIAG-ATTR] échec du diagnostic d'attributs : {e}")
-
-    # Diffusion (et persistance) des comptes désormais étiquetés.
-    for result in social_results:
-        callback(result)
-
-    for module_name in ("social", "github", "paste"):
-        await send_progress(websocket, search_id, module_name, "completed", f"Module {module_name} terminé", 100)
-
+    # confirmed_platforms ne dépend PAS de la classification (juste les domaines où
+    # Maigret a confirmé un compte) : calculable dès maintenant pour paramétrer les
+    # dorks plateformes — pas de chicken-and-egg avec la décision de confiance.
     confirmed_platforms = sorted({
         domain
         for r in social_results
@@ -588,6 +669,17 @@ async def run_layer1(
     })
     logger.info(f"[intelligence_engine] Couche 1A : plateformes confirmées = {confirmed_platforms}")
 
+    # github/paste ont streamé en direct : on peut les marquer terminés ici.
+    for module_name in ("github", "paste"):
+        await send_progress(websocket, search_id, module_name, "completed", f"Module {module_name} terminé", 100)
+
+    # ★ ENRICHISSEMENT : remplir raw_data["content"] des comptes "coquilles vides"
+    # AVANT la décision de confiance, pour donner de la matière à la corroboration
+    # et à la convergence inter-comptes. Ne lève jamais (isolé en interne).
+    await enrich_accounts(social_results + github_results, profile)
+
+    # web_search APRÈS enrichissement. Comme la classification est désormais
+    # postérieure, ces résultats web entrent aussi dans le filtrage/extraction aval.
     await send_progress(websocket, search_id, "web_search", "running", "Dorks web (adaptatifs)...", 30)
     web_results = await _safe_run(
         run_all_dorks(
@@ -603,6 +695,32 @@ async def run_layer1(
     )
 
     await send_progress(websocket, search_id, "web_search", "completed", "Module web_search terminé", 100)
+
+    # ★ Décision de confiance des comptes SOCIAUX APRÈS enrichissement + web_search
+    # (confirmed / corroborated / guessed). C'est ici que l'enrichissement porte.
+    corroborated_usernames = _classify_social_accounts(social_results, reference)
+
+    # DIAGNOSTIC TEMPORAIRE [DIAG-ATTR] : mesure la richesse des attributs APRÈS
+    # enrichissement (à retirer une fois les chiffres lus). N'altère aucune décision ;
+    # isolé en try/except pour ne jamais casser le pipeline.
+    try:
+        _diag_log_account_attributes(social_results, github_results)
+    except Exception as e:
+        logger.warning(f"[DIAG-ATTR] échec du diagnostic d'attributs : {e}")
+
+    # ★ Convergence inter-comptes : promeut des clusters de guessed mutuellement
+    # cohérents en corroborated (jamais confirmed). Alimente le profil principal via
+    # le routage corroborated EXISTANT. Isolée : un échec ne casse pas le pipeline.
+    try:
+        promoted = _run_convergence(social_results, github_results, github_login_confidence, profile)
+        corroborated_usernames |= promoted
+    except Exception as e:
+        logger.warning(f"[convergence] échec (ignoré) : {e}")
+
+    # Diffusion (et persistance) des comptes désormais étiquetés.
+    for result in social_results:
+        callback(result)
+    await send_progress(websocket, search_id, "social", "completed", "Module social terminé", 100)
 
     results_l1 = social_results + github_results + paste_results + web_results + anchored_dork_results
 
