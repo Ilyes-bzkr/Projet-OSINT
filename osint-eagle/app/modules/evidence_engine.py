@@ -31,10 +31,21 @@ __all__ = [
     "ConfirmedReference",
     "classify_pseudo",
     "evaluate_account",
+    "account_content_view",
     "norm",
     "norm_email",
     "loose_contains",
 ]
+
+# GitHub expose ses attributs à plat dans raw_data ; les autres comptes (Maigret)
+# sous raw_data["content"]. Cette table sert à présenter une vue unifiée.
+_GITHUB_TOPLEVEL = {
+    "fullname": "name",
+    "location": "location",
+    "occupation": "company",
+    "bio": "bio",
+    "email": "email",
+}
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _PHONE_RE = re.compile(r"(?:\+?\d[\s.\-]?){8,15}")
@@ -91,6 +102,32 @@ def loose_contains(haystack: Optional[str], needle: Optional[str], min_len: int 
     hay = _loose(haystack)
     nee = _loose(needle).strip()
     return bool(nee) and len(nee) >= min_len and nee in hay
+
+
+def account_content_view(raw_data: Optional[dict]) -> dict:
+    """Vue UNIFIÉE des attributs d'un compte, quelle que soit sa source.
+
+    - Maigret / social : attributs déjà sous raw_data["content"].
+    - GitHub : attributs à plat (name/location/company/bio/email/blog) → mappés
+      vers le même vocabulaire (fullname/location/occupation/bio/email/links).
+
+    Ne renvoie que les champs non vides ; {} si rien d'exploitable. Sert de
+    matière commune à l'enrichissement et à la convergence inter-comptes.
+    """
+    raw = raw_data or {}
+    content = {k: v for k, v in (raw.get("content") or {}).items() if v}
+    if content:
+        return dict(content)
+    # Pas de bloc content : tenter la forme GitHub (attributs à plat).
+    if raw.get("login"):
+        gh: dict = {}
+        for attr, key in _GITHUB_TOPLEVEL.items():
+            if raw.get(key):
+                gh[attr] = raw[key]
+        if raw.get("blog"):
+            gh["links"] = [raw["blog"]]
+        return gh
+    return {}
 
 
 @dataclass
