@@ -32,6 +32,7 @@ __all__ = [
     "classify_pseudo",
     "evaluate_account",
     "account_content_view",
+    "converge_accounts",
     "norm",
     "norm_email",
     "loose_contains",
@@ -296,3 +297,160 @@ def evaluate_account(
     if strong >= 1 or medium >= 2:
         return ConfidenceLevel.CORROBORATED.value, reasons
     return ConfidenceLevel.GUESSED.value, reasons
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONVERGENCE INTER-COMPTES (Piste A)
+# evaluate_account compare UN compte à la référence (ancres / GitHub confirmé).
+# Quand la référence est vide (ni ancre ni GitHub confirmé), aucun guessed ne peut
+# être promu. La convergence exploite la COHÉRENCE MUTUELLE : des comptes guessed
+# qui affichent les mêmes attributs distinctifs se prouvent l'un l'autre.
+# Plafond = corroborated (jamais confirmed). En cas de doute → guessed (sûr).
+# ─────────────────────────────────────────────────────────────────────────────
+_MIN_XLINK_HANDLE = 4
+
+
+def _is_nontrivial_name(name: Optional[str]) -> bool:
+    """Nom complet « non-trivial » : >= 2 tokens et assez long (évite qu'un simple
+    prénom partagé serve de signal)."""
+    tokens = [t for t in _loose(name).split() if t]
+    return len(_norm(name)) >= 6 and len(tokens) >= 2
+
+
+def _bio_similar(a: Optional[str], b: Optional[str]) -> bool:
+    """Bios quasi identiques : égalité normalisée OU fort recouvrement de tokens."""
+    ta = {t for t in _loose(a).split() if t}
+    tb = {t for t in _loose(b).split() if t}
+    if not ta or not tb:
+        return False
+    if _norm(a) == _norm(b):
+        return True
+    return len(ta & tb) / len(ta | tb) >= 0.8
+
+
+def _same_or_substring(a: str, b: str) -> bool:
+    la, lb = _loose(a), _loose(b)
+    return _norm(a) == _norm(b) or la in lb or lb in la
+
+
+def _references(a: dict, b: dict) -> bool:
+    """Vrai si le compte `a` pointe LITTÉRALEMENT vers `b` via ses liens sortants
+    (pseudo distinctif de `b` présent dans un lien de `a`)."""
+    handle = _norm(b.get("username"))
+    if len(handle) < _MIN_XLINK_HANDLE:
+        return False
+    links_blob = _norm(" ".join(a.get("content", {}).get("links") or []))
+    return handle in links_blob
+
+
+def _pair_signals(a: dict, b: dict) -> tuple[bool, set, list]:
+    """Analyse une paire de comptes. Retourne (incompatible, attributs_moyens, signaux_forts).
+
+    incompatible=True (divergence sur un attribut distinctif) ⇒ aucune arête : les
+    comptes restent dans des clusters séparés (garde-fou anti-homonyme).
+    """
+    ca, cb = a.get("content", {}), b.get("content", {})
+
+    # --- Divergence (homonymes distincts) : ville / occupation présentes et inconciliables ---
+    la, lb = ca.get("location"), cb.get("location")
+    if la and lb and not _same_or_substring(la, lb):
+        return True, set(), []
+    oa, ob = ca.get("occupation"), cb.get("occupation")
+    if oa and ob and not (_same_or_substring(oa, ob) or loose_contains(oa, ob, 3) or loose_contains(ob, oa, 3)):
+        return True, set(), []
+
+    mediums: set = set()
+    strong: list = []
+
+    fa, fb = ca.get("fullname"), cb.get("fullname")
+    if fa and fb and _norm(fa) == _norm(fb) and _is_nontrivial_name(fa):
+        mediums.add("fullname")
+    if la and lb and _same_or_substring(la, lb):
+        mediums.add("location")
+    if oa and ob and (_same_or_substring(oa, ob) or loose_contains(oa, ob, 3) or loose_contains(ob, oa, 3)):
+        mediums.add("occupation")
+    if _bio_similar(ca.get("bio"), cb.get("bio")):
+        mediums.add("bio")
+
+    ea, eb = ca.get("email"), cb.get("email")
+    if ea and eb and _norm_email(ea) == _norm_email(eb):
+        strong.append("email partagé")
+    if _references(a, b) or _references(b, a):
+        strong.append("lien croisé")
+
+    return False, mediums, strong
+
+
+def converge_accounts(accounts: list[dict]) -> list[dict]:
+    """Regroupe des comptes guessed en clusters mutuellement cohérents et décide
+    de leur promotion en corroborated.
+
+    Chaque `account` : {key, username, content:{fullname,location,occupation,bio,
+    email,links}}. Retourne une liste de clusters :
+        {"members": [key, ...], "promoted": bool, "signals": [str, ...]}
+
+    Promotion d'un cluster ⇔ il est INTERNEMENT cohérent (aucune paire divergente)
+    ET réunit AU MOINS un signal FORT, OU >= 2 attributs MOYENS distincts. Le palier
+    faible (variantes de pseudo) ne promeut jamais seul. Plafond = corroborated.
+    """
+    n = len(accounts)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        parent[find(x)] = find(y)
+
+    edge_med: dict = {}
+    edge_strong: dict = {}
+    incompatible_pairs: set = set()
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            incompatible, mediums, strong = _pair_signals(accounts[i], accounts[j])
+            if incompatible:
+                incompatible_pairs.add((i, j))
+                continue
+            if mediums or strong:
+                union(i, j)
+                edge_med[(i, j)] = mediums
+                edge_strong[(i, j)] = strong
+
+    components: dict = {}
+    for i in range(n):
+        components.setdefault(find(i), []).append(i)
+
+    clusters: list = []
+    for members in components.values():
+        keys = [accounts[m]["key"] for m in members]
+        if len(members) < 2:
+            clusters.append({"members": keys, "promoted": False, "signals": []})
+            continue
+
+        mset = set(members)
+        consistent = not any(i in mset and j in mset for (i, j) in incompatible_pairs)
+
+        medium_attrs: set = set()
+        strong_sigs: list = []
+        for (i, j), meds in edge_med.items():
+            if i in mset and j in mset:
+                medium_attrs |= meds
+        for (i, j), strs in edge_strong.items():
+            if i in mset and j in mset:
+                strong_sigs.extend(strs)
+
+        promoted = consistent and (bool(strong_sigs) or len(medium_attrs) >= 2)
+
+        signals = [f"FORT: {s}" for s in sorted(set(strong_sigs))]
+        signals += [f"MOYEN: {m}" for m in sorted(medium_attrs)]
+        signals.append("FAIBLE: variantes de pseudo")
+        if not consistent:
+            signals.append("conflit homonyme (divergence) → non promu")
+
+        clusters.append({"members": keys, "promoted": promoted, "signals": signals})
+
+    return clusters
