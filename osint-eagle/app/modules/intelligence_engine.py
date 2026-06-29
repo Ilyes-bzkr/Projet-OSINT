@@ -334,6 +334,122 @@ def _classify_social_accounts(
     return corroborated
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DIAGNOSTIC TEMPORAIRE [DIAG-ATTR] — mesure la richesse RÉELLE des attributs des
+# comptes évalués en couche 1A (combien portent fullname/ville/bio/occupation/
+# email/lien, combien ont un content vide = platform+username+url seulement).
+# But : chiffrer l'ampleur de l'enrichissement à construire avant la convergence
+# inter-comptes (Piste A). N'altère AUCUNE décision : pure observation.
+# À RETIRER une fois les chiffres lus (le helper + son appel dans run_layer1).
+# ─────────────────────────────────────────────────────────────────────────────
+def _diag_attr_view(result: OsintResult, source: str) -> dict:
+    """Vue normalisée des attributs d'un compte, quelle que soit sa source
+    (GitHub a ses champs à plat ; Maigret les expose sous raw_data['content'])."""
+    raw = result.raw_data or {}
+    if source == "GitHub":
+        return {
+            "platform": "GitHub",
+            "username": raw.get("login") or "?",
+            "fullname": raw.get("name"),
+            "ville": raw.get("location"),
+            "bio": raw.get("bio"),
+            "occupation": raw.get("company"),
+            "email": raw.get("email"),
+            "links": [raw["blog"]] if raw.get("blog") else [],
+            "avatar": raw.get("avatar_url"),
+        }
+    content = raw.get("content") or {}
+    return {
+        "platform": raw.get("platform") or "?",
+        "username": raw.get("username") or "?",
+        "fullname": content.get("fullname"),
+        "ville": content.get("location"),
+        "bio": content.get("bio"),
+        "occupation": content.get("occupation"),
+        "email": content.get("email"),
+        "links": content.get("links") or [],
+        "avatar": raw.get("photo_url"),
+    }
+
+
+def _diag_log_account_attributes(
+    social_results: list[OsintResult],
+    github_results: list[OsintResult],
+) -> None:
+    """Logge une ligne [DIAG-ATTR] par compte évalué puis une synthèse chiffrée.
+
+    DIAGNOSTIC TEMPORAIRE : observe la présence des attributs, ne modifie rien.
+    """
+    def _on(value) -> str:
+        return "oui" if value else "non"
+
+    views: list[tuple[str, dict]] = []
+
+    # GitHub : on ne compte que les profils RÉELLEMENT évalués par
+    # _classify_github_results (entrées "profil" portant un avatar, dédupliquées
+    # par login) — pas les entrées email/commit qui partagent le même login.
+    seen_logins: set = set()
+    for result in github_results:
+        raw = result.raw_data or {}
+        login = raw.get("login")
+        if not login or not raw.get("avatar_url") or login in seen_logins:
+            continue
+        seen_logins.add(login)
+        views.append(("GitHub", _diag_attr_view(result, "GitHub")))
+
+    for result in social_results:
+        views.append(("Maigret", _diag_attr_view(result, "Maigret")))
+
+    counts = {"fullname": 0, "ville": 0, "bio": 0, "occupation": 0, "email": 0, "links": 0, "avatar": 0}
+    with_attr = 0
+    n_maigret = 0
+    n_github = 0
+
+    for source, a in views:
+        if source == "GitHub":
+            n_github += 1
+        else:
+            n_maigret += 1
+
+        content_present = any([a["fullname"], a["ville"], a["bio"], a["occupation"], a["email"], a["links"]])
+        if content_present:
+            with_attr += 1
+        for key in ("fullname", "ville", "bio", "occupation", "email", "avatar"):
+            if a[key]:
+                counts[key] += 1
+        if len(a["links"]) >= 1:
+            counts["links"] += 1
+
+        logger.info(
+            f"[DIAG-ATTR] {a['platform']} @{a['username']} | "
+            f"fullname={_on(a['fullname'])} ville={_on(a['ville'])} bio={_on(a['bio'])} "
+            f"occupation/employer={_on(a['occupation'])} email={_on(a['email'])} "
+            f"liens_croisés={len(a['links'])} avatar={_on(a['avatar'])} | "
+            f"content_vide={_on(not content_present)}"
+        )
+
+    total = len(views)
+    logger.info("[DIAG-ATTR] === SYNTHÈSE ===")
+    logger.info(f"[DIAG-ATTR] Total comptes évalués : {total}")
+    logger.info(
+        "[DIAG-ATTR] Avec au moins un attribut exploitable "
+        f"(fullname|ville|bio|occupation|email|lien) : {with_attr} / {total}"
+    )
+    logger.info(
+        "[DIAG-ATTR] content totalement vide (platform+username+url seulement) : "
+        f"{total - with_attr} / {total}"
+    )
+    logger.info(
+        f"[DIAG-ATTR] Détail par attribut : fullname={counts['fullname']}, "
+        f"ville={counts['ville']}, bio={counts['bio']}, occupation={counts['occupation']}, "
+        f"email={counts['email']}, liens_croisés≥1={counts['links']}, avatar={counts['avatar']}"
+    )
+    logger.info(
+        f"[DIAG-ATTR] Répartition des sources : Maigret={n_maigret} comptes, "
+        f"GitHub={n_github} profils"
+    )
+
+
 def _clean_json_text(raw_text: str) -> str:
     text = raw_text.strip()
     if text.startswith("```"):
@@ -449,6 +565,14 @@ async def run_layer1(
     github_login_confidence = _classify_github_results(github_results, anchors, reference)
     _augment_reference_with_confirmed_github(reference, github_results, github_login_confidence)
     corroborated_usernames = _classify_social_accounts(social_results, reference)
+
+    # DIAGNOSTIC TEMPORAIRE [DIAG-ATTR] : mesure la richesse des attributs des
+    # comptes (à retirer une fois les chiffres lus). N'altère aucune décision ;
+    # isolé en try/except pour ne jamais casser le pipeline.
+    try:
+        _diag_log_account_attributes(social_results, github_results)
+    except Exception as e:
+        logger.warning(f"[DIAG-ATTR] échec du diagnostic d'attributs : {e}")
 
     # Diffusion (et persistance) des comptes désormais étiquetés.
     for result in social_results:
