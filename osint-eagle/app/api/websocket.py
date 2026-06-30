@@ -11,6 +11,7 @@ from typing import Callable, Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from app.api.validation_channel import ValidationChannel
 from app.ai.analyzer import filter_results
 from app.ai.profiler import build_profile
 from app.ai.reporter import generate_report_html
@@ -289,8 +290,8 @@ async def _ai_heartbeat(websocket: WebSocket, search_id: str) -> None:
             return
 
 
-async def _stop_heartbeat(task: Optional[asyncio.Task]) -> None:
-    """Annule proprement la tâche heartbeat (idempotent, absorbe CancelledError)."""
+async def _cancel_task(task: Optional[asyncio.Task]) -> None:
+    """Annule proprement une tâche concurrente (idempotent, absorbe les erreurs)."""
     if task is None or task.done():
         return
     task.cancel()
@@ -300,6 +301,40 @@ async def _stop_heartbeat(task: Optional[asyncio.Task]) -> None:
         pass
     except Exception:
         pass
+
+
+async def _stop_heartbeat(task: Optional[asyncio.Task]) -> None:
+    """Annule proprement la tâche heartbeat (idempotent, absorbe CancelledError)."""
+    await _cancel_task(task)
+
+
+async def _validation_reader(websocket: WebSocket, channel: ValidationChannel) -> None:
+    """Lit les messages entrants pendant l'orchestration (Phase C — plomberie).
+
+    Tourne en coroutine concurrente de l'orchestrateur. Route les messages
+    `validation_response` vers le canal (`channel.submit`) pour réveiller un
+    checkpoint en attente ; tout autre type entrant est ignoré (aucune logique
+    métier en Phase C). À la déconnexion, marque la socket fermée et replie tout
+    checkpoint en attente (`channel.fail`) pour ne jamais bloquer l'orchestrateur.
+    """
+    try:
+        while getattr(websocket.state, "is_connected", True):
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(data, dict) and data.get("type") == "validation_response":
+                channel.submit(data.get("data"))
+            # Autres types entrants : ignorés en Phase C.
+    except asyncio.CancelledError:
+        raise
+    except WebSocketDisconnect:
+        websocket.state.is_connected = False
+        channel.fail()
+    except Exception as e:
+        logger.warning(f"[validation_reader] arrêt sur erreur : {e}")
+        channel.fail()
 
 
 async def _run_ai_pipeline(
@@ -426,9 +461,29 @@ async def handle_search_websocket(websocket: WebSocket):
             data={"name": request.name}
         ))
 
-        # Lancer la recherche (orchestrateur 3 couches)
+        # Lancer la recherche (orchestrateur 3 couches).
+        # Mode interactif (Phase C) : on arme un canal de validation + une tâche
+        # lectrice concurrente qui lit les messages entrants pendant la recherche.
+        # Hors mode interactif (défaut), rien n'est armé → comportement identique.
         from app.modules.intelligence_engine import run_intelligence_engine
-        total_results, risk_score = await run_intelligence_engine(websocket, request, search_id)
+
+        reader_task: Optional[asyncio.Task] = None
+        if getattr(request, "interactive", False):
+            channel = ValidationChannel(
+                search_id=search_id,
+                send=lambda msg: send_message(websocket, msg),
+                is_connected=lambda: getattr(websocket.state, "is_connected", True),
+                enabled=True,
+            )
+            websocket.state.validation_channel = channel
+            reader_task = asyncio.create_task(_validation_reader(websocket, channel))
+            logger.info("[websocket] mode interactif actif (checkpoint de validation armé)")
+
+        try:
+            total_results, risk_score = await run_intelligence_engine(websocket, request, search_id)
+        finally:
+            await _cancel_task(reader_task)
+            websocket.state.validation_channel = None
 
         # Marquer comme terminé en DB
         await _mark_search_completed(search_id, total_results, risk_score)

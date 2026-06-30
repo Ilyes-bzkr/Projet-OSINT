@@ -91,6 +91,14 @@ class SearchRequest(BaseModel):
     enable_data_brokers: bool = Field(default=True, description="Activer le scraping data brokers")
     enable_dark_web: bool = Field(default=False, description="Activer la recherche dark web")
     anchors: SearchAnchors = Field(default_factory=SearchAnchors, description="Ancres de vérité optionnelles")
+    interactive: bool = Field(
+        default=False,
+        description=(
+            "Active le checkpoint de validation interactif entre couche 1 et "
+            "couche 2 (pause/reprise WebSocket). Défaut False : comportement "
+            "non-interactif identique, de bout en bout sans pause."
+        ),
+    )
 
 
 class SearchStatus(BaseModel):

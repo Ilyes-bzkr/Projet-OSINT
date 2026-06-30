@@ -69,8 +69,14 @@ class OsintResult(BaseModel):
 
 
 class WebSocketMessage(BaseModel):
-    """Message envoyé via WebSocket au frontend."""
-    type: str  # result | progress | error | complete | ai_report
+    """Message envoyé via WebSocket au frontend.
+
+    `validation_request` (sortant) / `validation_response` (entrant) portent le
+    flux interactif de pause/reprise : le serveur émet un `validation_request`
+    au checkpoint et suspend l'orchestration jusqu'à recevoir un
+    `validation_response` (ou un repli sur timeout/déconnexion).
+    """
+    type: str  # result | progress | error | complete | ai_report | validation_request | validation_response
     module: Optional[str] = None
     data: Optional[Any] = None
     message: Optional[str] = None

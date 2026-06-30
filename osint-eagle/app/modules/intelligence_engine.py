@@ -599,6 +599,68 @@ def _gate_web_documents(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Phase C — checkpoint interactif de validation (plomberie pure)
+# Entre couche 1 et couche 2 : si un canal de validation est armé (mode
+# interactif), on présente les candidats et on SUSPEND l'orchestration jusqu'à
+# une réponse humaine (ou un repli sur timeout/déconnexion). AUCUNE logique
+# métier ici : la sélection est seulement journalisée. Le ré-ancrage et la
+# relance ciblée viendront en Phase D. No-op total hors mode interactif.
+# ─────────────────────────────────────────────────────────────────────────────
+def _build_validation_candidates(results_l1: list[OsintResult]) -> dict:
+    """Aperçu déterministe des comptes candidats à valider (social/github).
+
+    Ne retient que les résultats porteurs d'un compte (username/login) : ce sont
+    les éléments désambiguïsants qu'un humain peut cocher. Pur, sans appel IA.
+    """
+    candidates = []
+    for result in results_l1:
+        raw = result.raw_data or {}
+        username = raw.get("username") or raw.get("login")
+        if not username:
+            continue
+        candidates.append({
+            "id": result.id,
+            "platform": raw.get("platform") or result.module.value,
+            "username": username,
+            "url": result.url,
+            "photo_url": raw.get("photo_url"),
+            "confidence": raw.get("confidence"),
+            "cluster_id": raw.get("cluster_id"),
+            "in_target_cluster": raw.get("in_target_cluster"),
+        })
+    return {"candidates": candidates}
+
+
+async def _interactive_checkpoint(
+    websocket,
+    search_id: str,
+    results_l1: list[OsintResult],
+) -> Optional[object]:
+    """Point de pause/reprise entre couche 1 et couche 2 (Phase C).
+
+    Si aucun canal n'est armé (mode non-interactif) ou s'il est désactivé, rend
+    `None` immédiatement → l'orchestrateur poursuit comme aujourd'hui. Sinon,
+    émet les candidats, attend la décision (ou un repli), et la journalise.
+    """
+    state = getattr(websocket, "state", None)
+    channel = getattr(state, "validation_channel", None) if state is not None else None
+    if channel is None or not getattr(channel, "enabled", False):
+        return None
+
+    payload = _build_validation_candidates(results_l1)
+    logger.info(
+        f"[checkpoint] validation interactive : {len(payload['candidates'])} candidat(s) "
+        f"proposé(s), orchestration suspendue"
+    )
+    selection = await channel.request_validation(payload)
+    if selection is None:
+        logger.info("[checkpoint] aucune validation reçue (repli) — poursuite normale")
+    else:
+        logger.info(f"[checkpoint] validation reçue (ignorée en Phase C) : {selection!r}")
+    return selection
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DIAGNOSTIC TEMPORAIRE [DIAG-ATTR] — mesure la richesse RÉELLE des attributs des
 # comptes évalués en couche 1A (combien portent fullname/ville/bio/occupation/
 # email/lien, combien ont un content vide = platform+username+url seulement).
@@ -1211,6 +1273,13 @@ async def run_intelligence_engine(websocket, request: SearchRequest, search_id: 
             profile, search_id, callback, websocket, anchors, web_browser, web_semaphore
         )
         await send_progress(websocket, search_id, "intelligence_engine", "running", "Couche 1 terminée", 40)
+
+        # Phase C — checkpoint interactif (no-op hors mode interactif). Isolé en
+        # try/except : une erreur de validation ne doit JAMAIS rompre le pipeline.
+        try:
+            await _interactive_checkpoint(websocket, search_id, results_l1)
+        except Exception as e:
+            logger.warning(f"[checkpoint] ignoré sur erreur : {e}")
 
         await send_progress(websocket, search_id, "intelligence_engine", "running", "Couche 2 : approfondissement...", 45)
         results_l2 = await run_layer2(
