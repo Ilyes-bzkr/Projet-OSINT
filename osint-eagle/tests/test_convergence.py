@@ -110,3 +110,63 @@ def test_compatible_city_substring_is_a_match_not_divergence():
         _acc("b", "ilyes-bouzekri", fullname="Ilyes Bouzekri", location="Paris, France"),
     ])
     assert _cluster_of(clusters, "a")["promoted"] is True
+
+
+# ─── Phase A : grappes d'identité (strict_edges) + pseudo distinctif ─────────
+
+def _node(key, username, first="Foo", last="Bar", **content):
+    return {"key": key, "username": username, "content": content,
+            "first_name": first, "last_name": last}
+
+
+def test_strict_edges_name_only_does_not_merge():
+    # Même nom complet SEUL (1 moyen) → en mode strict, AUCUNE arête → grappes
+    # séparées (correction du faux positif homonyme).
+    clusters = converge_accounts([
+        _acc("a", "ilyesbouzekri", fullname="Ilyes Bouzekri"),
+        _acc("b", "ilyes-bouzekri", fullname="Ilyes Bouzekri"),
+    ], strict_edges=True)
+    assert _cluster_of(clusters, "a") is not _cluster_of(clusters, "b")
+
+
+def test_strict_edges_two_mediums_still_merge():
+    clusters = converge_accounts([
+        _acc("a", "ilyesbouzekri", fullname="Ilyes Bouzekri", location="Paris"),
+        _acc("b", "ilyes-bouzekri", fullname="Ilyes Bouzekri", location="Paris"),
+    ], strict_edges=True)
+    assert _cluster_of(clusters, "a") is _cluster_of(clusters, "b")
+
+
+def test_same_distinctive_username_is_strong():
+    # Pseudo distinctif identique (résidu "uniquehandle" hors prénom/nom) → FORT.
+    clusters = converge_accounts([
+        _node("a", "uniquehandle"),
+        _node("b", "uniquehandle"),
+    ], strict_edges=True)
+    c = _cluster_of(clusters, "a")
+    assert {"a", "b"} == set(c["members"])
+    assert any("pseudo distinctif identique" in s for s in c["signals"])
+
+
+def test_simple_pseudo_variants_not_strong():
+    # Variantes du nom (pseudo SIMPLE) → pas de signal fort → non fusionnées en strict.
+    clusters = converge_accounts([
+        _acc("a", "ilyesbouzekri"),
+        _acc("b", "ilyes.bouzekri"),
+    ], strict_edges=True)
+    assert _cluster_of(clusters, "a") is not _cluster_of(clusters, "b")
+
+
+def test_anchor_node_pulls_linked_account_not_homonym():
+    # Nœud-ancre (email X + nom + Paris). A partage l'email → rejoint l'ancre (FORT).
+    # B n'a que le même nom mais ville divergente (Tokyo) → écarté de la grappe-cible.
+    clusters = converge_accounts([
+        _node("anchor", "", first="Ilyes", last="Bouzekri",
+              email="ilyes@mail.com", fullname="Ilyes Bouzekri", location="Paris"),
+        _node("a", "ilyesbouzekri", first="Ilyes", last="Bouzekri", email="ilyes@mail.com"),
+        _node("b", "ilyes-bouzekri", first="Ilyes", last="Bouzekri",
+              fullname="Ilyes Bouzekri", location="Tokyo"),
+    ], strict_edges=True)
+    target = _cluster_of(clusters, "anchor")
+    assert "a" in target["members"]
+    assert "b" not in target["members"]

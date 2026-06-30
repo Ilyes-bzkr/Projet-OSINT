@@ -378,20 +378,35 @@ def _pair_signals(a: dict, b: dict) -> tuple[bool, set, list]:
     if _references(a, b) or _references(b, a):
         strong.append("lien croisé")
 
+    # Pseudo DISTINCTIF identique (non dérivable du nom) : preuve forte de même
+    # personne. Un pseudo SIMPLE (= le nom décliné) ne compte pas (cf. P2).
+    ua, ub = a.get("username"), b.get("username")
+    if (ua and ub and _norm(ua) == _norm(ub)
+            and classify_pseudo(ua, a.get("first_name", ""), a.get("last_name", "")) == "distinctive"):
+        strong.append("pseudo distinctif identique")
+
     return False, mediums, strong
 
 
-def converge_accounts(accounts: list[dict]) -> list[dict]:
-    """Regroupe des comptes guessed en clusters mutuellement cohérents et décide
-    de leur promotion en corroborated.
+def converge_accounts(accounts: list[dict], strict_edges: bool = False) -> list[dict]:
+    """Regroupe des comptes en clusters mutuellement cohérents et décide de leur
+    promotion en corroborated.
 
     Chaque `account` : {key, username, content:{fullname,location,occupation,bio,
-    email,links}}. Retourne une liste de clusters :
+    email,links}, first_name, last_name}. Retourne une liste de clusters :
         {"members": [key, ...], "promoted": bool, "signals": [str, ...]}
 
     Promotion d'un cluster ⇔ il est INTERNEMENT cohérent (aucune paire divergente)
     ET réunit AU MOINS un signal FORT, OU >= 2 attributs MOYENS distincts. Le palier
     faible (variantes de pseudo) ne promeut jamais seul. Plafond = corroborated.
+
+    `strict_edges` : règle de FORMATION des arêtes (regroupement), distincte de la
+    règle de promotion.
+    - False (défaut, convergence) : une arête dès qu'il existe un signal (>=1 moyen
+      ou fort). La promotion reste conditionnée au seuil ci-dessus.
+    - True (grappes d'identité, Piste A phase A) : une arête exige une VRAIE liaison
+      (>=1 fort OU >=2 moyens distincts). Un nom partagé seul (1 moyen) ne fusionne
+      donc PAS deux nœuds → homonymes séparés.
     """
     n = len(accounts)
     parent = list(range(n))
@@ -415,7 +430,8 @@ def converge_accounts(accounts: list[dict]) -> list[dict]:
             if incompatible:
                 incompatible_pairs.add((i, j))
                 continue
-            if mediums or strong:
+            has_edge = (bool(strong) or len(mediums) >= 2) if strict_edges else bool(mediums or strong)
+            if has_edge:
                 union(i, j)
                 edge_med[(i, j)] = mediums
                 edge_strong[(i, j)] = strong

@@ -425,6 +425,111 @@ def _run_convergence(
     return promoted_social
 
 
+def _assign_identity_clusters(
+    social_results: list[OsintResult],
+    github_results: list[OsintResult],
+    profile: NameProfile,
+    anchors: Optional[SearchAnchors],
+    reference: evidence_engine.ConfirmedReference,
+) -> None:
+    """Phase A — grappes d'identité : regroupe les comptes (social + GitHub) par
+    cohérence STRICTE et, si des ancres existent, injecte un nœud-ancre dont la
+    grappe devient la « grappe-cible ». Tag PUREMENT ADDITIF de raw_data :
+        - raw_data["cluster_id"]        : identifiant de grappe (c0, c1, …)
+        - raw_data["in_target_cluster"] : bool, présent seulement en mode A (ancres)
+
+    Aucune décision de routage ici (c'est la phase B qui exploitera ces tags).
+    """
+    descriptors: list[dict] = []
+    social_by_key: dict[str, OsintResult] = {}
+
+    for idx, result in enumerate(social_results):
+        raw = result.raw_data or {}
+        username = raw.get("username")
+        if not username:
+            continue
+        key = f"s{idx}"
+        descriptors.append({
+            "key": key, "username": username,
+            "content": evidence_engine.account_content_view(raw),
+            "first_name": profile.first_name, "last_name": profile.last_name,
+        })
+        social_by_key[key] = result
+
+    github_logins: list[str] = []
+    for result in github_results:
+        raw = result.raw_data or {}
+        login = raw.get("login")
+        if not login or login in github_logins:
+            continue
+        github_logins.append(login)
+        descriptors.append({
+            "key": f"g{login}", "username": login,
+            "content": evidence_engine.account_content_view(raw),
+            "first_name": profile.first_name, "last_name": profile.last_name,
+        })
+
+    # Nœud-ancre (mode A) : agrège les identifiants fiables fournis par l'utilisateur.
+    anchor_key: Optional[str] = None
+    if anchors is not None and not anchors.is_empty():
+        content: dict = {}
+        if reference.emails:
+            content["email"] = sorted(reference.emails)[0]
+        if anchors.city:
+            content["location"] = anchors.city
+        if anchors.employer:
+            content["occupation"] = anchors.employer
+        if profile.full_name:
+            content["fullname"] = profile.full_name
+        if reference.links:
+            content["links"] = sorted(reference.links)
+        anchor_key = "anchor"
+        descriptors.append({
+            "key": anchor_key, "username": (anchors.username or "").lstrip("@"),
+            "content": content,
+            "first_name": profile.first_name, "last_name": profile.last_name,
+        })
+
+    if len(descriptors) < 2:
+        return
+
+    clusters = evidence_engine.converge_accounts(descriptors, strict_edges=True)
+
+    key_to_cid: dict[str, str] = {}
+    target_cid: Optional[str] = None
+    for i, cluster in enumerate(clusters):
+        cid = f"c{i}"
+        if anchor_key and anchor_key in cluster["members"]:
+            target_cid = cid
+        for key in cluster["members"]:
+            key_to_cid[key] = cid
+
+    def _tag(result: OsintResult, key: str) -> None:
+        cid = key_to_cid.get(key)
+        if not cid:
+            return
+        result.raw_data["cluster_id"] = cid
+        if target_cid is not None:
+            result.raw_data["in_target_cluster"] = (cid == target_cid)
+
+    for key, result in social_by_key.items():
+        _tag(result, key)
+    login_to_cid = {login: key_to_cid.get(f"g{login}") for login in github_logins}
+    for result in github_results:
+        raw = result.raw_data or {}
+        login = raw.get("login")
+        if login and login_to_cid.get(login):
+            _tag(result, f"g{login}")
+
+    sizes: dict[str, int] = {}
+    for key, cid in key_to_cid.items():
+        if key == anchor_key:
+            continue
+        sizes[cid] = sizes.get(cid, 0) + 1
+    mode = f"grappe-cible={target_cid}" if target_cid is not None else "aucune ancre (mode B)"
+    logger.info(f"[clusters] {len(sizes)} grappe(s) d'identité ; tailles={sizes} ; {mode}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DIAGNOSTIC TEMPORAIRE [DIAG-ATTR] — mesure la richesse RÉELLE des attributs des
 # comptes évalués en couche 1A (combien portent fullname/ville/bio/occupation/
@@ -716,6 +821,13 @@ async def run_layer1(
         corroborated_usernames |= promoted
     except Exception as e:
         logger.warning(f"[convergence] échec (ignoré) : {e}")
+
+    # ★ Phase A — grappes d'identité : tag additif cluster_id / in_target_cluster
+    # (désambiguïsation homonymes). Aucune décision de routage ici (phase B).
+    try:
+        _assign_identity_clusters(social_results, github_results, profile, anchors, reference)
+    except Exception as e:
+        logger.warning(f"[clusters] échec (ignoré) : {e}")
 
     # Diffusion (et persistance) des comptes désormais étiquetés.
     for result in social_results:
