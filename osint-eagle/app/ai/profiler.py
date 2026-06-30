@@ -150,9 +150,68 @@ def _group_by_module(results: list[OsintResult]) -> dict[str, list[dict]]:
     return grouped
 
 
-def _is_guessed(result: OsintResult) -> bool:
-    """Compte au même nom NON vérifié (homonyme possible) à exclure du profil principal."""
-    return (result.raw_data or {}).get("confidence") == ConfidenceLevel.GUESSED.value
+_TRUSTED_CONF = {ConfidenceLevel.CONFIRMED.value, ConfidenceLevel.CORROBORATED.value}
+
+
+def _is_account(result: OsintResult) -> bool:
+    raw = result.raw_data or {}
+    return bool(raw.get("username") or raw.get("login"))
+
+
+def _is_offtarget(result: OsintResult) -> bool:
+    """True si le résultat n'appartient PAS à l'identité cible → exclu du profil
+    principal (phase B, désambiguïsation par grappe).
+
+    Priorités :
+    - confirmed / corroborated : appartenance ÉTABLIE → toujours profil principal
+      (on ne bannit jamais un compte prouvé, même hors grappe-cible).
+    - in_target_cluster == True  → profil principal (grappe-cible, mode A).
+    - in_target_cluster == False → hors-cible (autre grappe d'homonyme, ou document
+      au nom seul non rattaché à une ancre — P5).
+    - tag absent (résultats dérivés couche 2, paste, breach, mode B) → règle
+      historique : guessed = hors-cible, sinon profil principal.
+    """
+    raw = result.raw_data or {}
+    if raw.get("confidence") in _TRUSTED_CONF:
+        return False
+    in_target = raw.get("in_target_cluster")
+    if in_target is True:
+        return False
+    if in_target is False:
+        return True
+    return raw.get("confidence") == ConfidenceLevel.GUESSED.value
+
+
+def _clusters_overview(results: list[OsintResult]) -> list[dict]:
+    """Aperçu déterministe (sans IA) des grappes d'identité, pour présenter les
+    personnes distinctes trouvées sous ce nom (mode B) ou situer la grappe-cible."""
+    clusters: dict[str, dict] = {}
+    for result in results:
+        raw = result.raw_data or {}
+        cid = raw.get("cluster_id")
+        if not cid or not _is_account(result):
+            continue
+        entry = clusters.setdefault(cid, {"cluster_id": cid, "is_target": False, "accounts": []})
+        if raw.get("in_target_cluster") is True:
+            entry["is_target"] = True
+        entry["accounts"].append({
+            "platform": raw.get("platform") or _domain_of(result.url),
+            "username": raw.get("username") or raw.get("login") or "",
+            "url": result.url,
+        })
+    return list(clusters.values())
+
+
+def _finalize_profile(parsed: dict, results: list[OsintResult]) -> dict:
+    """Renseigne de façon DÉTERMINISTE les sections de désambiguïsation, quoi que
+    l'IA ait produit : comptes hors-cible (homonymes) et aperçu des grappes."""
+    parsed["unverified_namesakes"] = [
+        _namesake_payload(r) for r in results if _is_offtarget(r) and _is_account(r)
+    ]
+    overview = _clusters_overview(results)
+    if len(overview) > 1:
+        parsed["identity_clusters"] = overview
+    return parsed
 
 
 def _namesake_payload(result: OsintResult) -> dict:
@@ -166,18 +225,19 @@ def _namesake_payload(result: OsintResult) -> dict:
 
 
 def _build_user_prompt(profile: NameProfile, results: list[OsintResult]) -> str:
-    # Le profil principal ne se construit QUE sur les données confirmées/corroborées ;
-    # les comptes "guessed" sont isolés pour ne pas contaminer l'identité.
-    main = [r for r in results if not _is_guessed(r)]
-    guessed = [r for r in results if _is_guessed(r)]
+    # Le profil principal ne se construit QUE sur la grappe-cible (mode A) / les
+    # données confirmées-corroborées ; les comptes hors-cible (autres grappes
+    # d'homonymes) et les documents au nom seul non rattachés sont isolés.
+    main = [r for r in results if not _is_offtarget(r)]
+    offtarget_accounts = [r for r in results if _is_offtarget(r) and _is_account(r)]
 
     data_str = json.dumps(_group_by_module(main), ensure_ascii=False)
-    namesakes_str = json.dumps([_namesake_payload(r) for r in guessed], ensure_ascii=False)
+    namesakes_str = json.dumps([_namesake_payload(r) for r in offtarget_accounts], ensure_ascii=False)
 
     return (
         f"Construis une fiche de renseignement complète pour :\n{profile.full_name}\n\n"
         f"Données CONFIRMÉES / CORROBORÉES ({len(main)} sources) :\n{data_str}\n\n"
-        f"Comptes au même nom NON VÉRIFIÉS (homonymes possibles, {len(guessed)}) :\n{namesakes_str}\n\n"
+        f"Comptes au même nom NON VÉRIFIÉS (homonymes possibles, {len(offtarget_accounts)}) :\n{namesakes_str}\n\n"
         "RÈGLES IMPÉRATIVES :\n"
         "- Construis TOUT le profil principal (identité, localisation, contact, "
         "professionnel, activités, réseau, etc.) UNIQUEMENT à partir des données "
@@ -270,9 +330,10 @@ def _minimal_fallback_profile(profile: NameProfile, results: list[OsintResult]) 
     namesakes = []
     for result in results:
         raw = result.raw_data or {}
-        # Comptes non vérifiés : isolés, jamais mêlés à l'identité principale.
-        if _is_guessed(result):
-            if raw.get("platform") or result.url:
+        # Hors-cible (autre grappe / document non rattaché) : isolé, jamais mêlé
+        # à l'identité principale.
+        if _is_offtarget(result):
+            if _is_account(result):
                 namesakes.append(_namesake_payload(result))
             continue
         if raw.get("email"):
@@ -288,7 +349,7 @@ def _minimal_fallback_profile(profile: NameProfile, results: list[OsintResult]) 
                 "severity": "critical",
             })
 
-    return {
+    return _finalize_profile({
         "identity": {
             "full_name": profile.full_name, "first_name": profile.first_name,
             "last_name": profile.last_name, "age_estimated": None, "nationality": None,
@@ -328,7 +389,7 @@ def _minimal_fallback_profile(profile: NameProfile, results: list[OsintResult]) 
         "summary": "Profil minimal généré automatiquement (analyse IA indisponible).",
         "confidence_overall": "low",
         "data_freshness": "inconnu",
-    }
+    }, results)
 
 
 async def build_profile(
@@ -366,7 +427,7 @@ async def build_profile(
             if parsed is not None:
                 if attempt == 0 and not raw_text.rstrip().endswith("}"):
                     logger.info("[AI] Profil récupéré après réparation d'une réponse tronquée")
-                return parsed
+                return _finalize_profile(parsed, results)
             # Échec malgré la réparation : on logge début ET fin pour confirmer
             # visuellement une troncature (le JSON commence bien mais finit coupé).
             stop_reason = getattr(response, "stop_reason", None)

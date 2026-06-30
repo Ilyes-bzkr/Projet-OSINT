@@ -530,6 +530,74 @@ def _assign_identity_clusters(
     logger.info(f"[clusters] {len(sizes)} grappe(s) d'identité ; tailles={sizes} ; {mode}")
 
 
+def _doc_anchor_linked(
+    result: OsintResult,
+    anchors: SearchAnchors,
+    reference: evidence_engine.ConfirmedReference,
+    profile: NameProfile,
+) -> bool:
+    """P5 — un document/web est rattaché à la cible s'il référence une ancre :
+    pseudo distinctif / email / URL d'ancre (FORT), ou nom complet + employeur/ville
+    d'ancre (MOYEN). Le nom seul ne suffit JAMAIS."""
+    text = " ".join(p for p in (result.title, result.snippet, result.url) if p).lower()
+    if not text:
+        return False
+    norm_text = evidence_engine.norm(text)
+
+    if anchors.username:
+        handle = anchors.username.lstrip("@")
+        nh = evidence_engine.norm(handle)
+        if (len(nh) >= 4
+                and evidence_engine.classify_pseudo(handle, profile.first_name, profile.last_name) == "distinctive"
+                and nh in norm_text):
+            return True
+
+    for email in reference.emails:
+        if email and email.lower() in text:
+            return True
+
+    for link in reference.links:
+        parsed = urllib.parse.urlparse(link)
+        token = (parsed.netloc + parsed.path).strip("/").lower()
+        if len(token) >= 4 and token in text:
+            return True
+
+    name_present = (evidence_engine.loose_contains(text, profile.first_name, 2)
+                    and evidence_engine.loose_contains(text, profile.last_name, 2))
+    if name_present:
+        if anchors.employer and evidence_engine.loose_contains(text, anchors.employer, 3):
+            return True
+        if anchors.city and evidence_engine.loose_contains(text, anchors.city, 3):
+            return True
+
+    return False
+
+
+def _gate_web_documents(
+    web_results: list[OsintResult],
+    anchors: Optional[SearchAnchors],
+    reference: evidence_engine.ConfirmedReference,
+    profile: NameProfile,
+) -> None:
+    """P5 — tag additif des résultats web/documents : in_target_cluster=True s'ils
+    sont rattachés à une ancre, False sinon (= écartés du profil principal en aval).
+
+    Mode B (aucune ancre) : pas de gating documentaire (rien à quoi rattacher).
+    """
+    if anchors is None or anchors.is_empty():
+        return
+    linked = 0
+    for result in web_results:
+        is_linked = _doc_anchor_linked(result, anchors, reference, profile)
+        result.raw_data = result.raw_data or {}
+        result.raw_data["in_target_cluster"] = is_linked
+        linked += int(is_linked)
+    logger.info(
+        f"[documents] {linked}/{len(web_results)} document(s) rattaché(s) à une ancre ; "
+        f"{len(web_results) - linked} écarté(s) (nom seul)"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DIAGNOSTIC TEMPORAIRE [DIAG-ATTR] — mesure la richesse RÉELLE des attributs des
 # comptes évalués en couche 1A (combien portent fullname/ville/bio/occupation/
@@ -828,6 +896,13 @@ async def run_layer1(
         _assign_identity_clusters(social_results, github_results, profile, anchors, reference)
     except Exception as e:
         logger.warning(f"[clusters] échec (ignoré) : {e}")
+
+    # ★ Phase B — gating documentaire (P5) : un document/web n'entre dans le profil
+    # cible que s'il est rattaché à une ancre (sinon écarté du profil principal).
+    try:
+        _gate_web_documents(web_results + anchored_dork_results, anchors, reference, profile)
+    except Exception as e:
+        logger.warning(f"[documents] gating échoué (ignoré) : {e}")
 
     # Diffusion (et persistance) des comptes désormais étiquetés.
     for result in social_results:

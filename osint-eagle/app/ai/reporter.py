@@ -279,6 +279,50 @@ def _render_privacy_score(privacy: dict) -> str:
     </div>"""
 
 
+def _render_account_list(accounts: list) -> str:
+    items = []
+    for entry in accounts[:50]:
+        platform = _esc(entry.get("platform") or "?")
+        username = _esc(entry.get("username") or "")
+        label = f"{platform} — @{username}" if username else platform
+        url = entry.get("url")
+        if url:
+            items.append(f'<li><a href="{_esc(url)}" target="_blank" rel="noopener">{label}</a></li>')
+        else:
+            items.append(f"<li>{label}</li>")
+    return f"<ul>{''.join(items)}</ul>"
+
+
+def _render_namesakes(namesakes: list) -> str:
+    """Comptes au même nom NON rattachés à la cible (homonymes possibles)."""
+    if not namesakes:
+        return ""
+    return (
+        '<div class="ai-section">'
+        "<h3>Comptes au même nom — non vérifiés (homonymes possibles)</h3>"
+        f"{_render_account_list(namesakes)}</div>"
+    )
+
+
+def _render_identity_clusters(clusters: list) -> str:
+    """Personnes distinctes trouvées sous ce nom (mode B / situe la grappe-cible)."""
+    if not clusters or len(clusters) < 2:
+        return ""
+    blocks = []
+    for cluster in clusters:
+        accounts = cluster.get("accounts") or []
+        title = "Grappe cible" if cluster.get("is_target") else "Identité distincte"
+        blocks.append(
+            f"<div><strong>{title}</strong> ({len(accounts)} compte(s))"
+            f"{_render_account_list(accounts)}</div>"
+        )
+    return (
+        '<div class="ai-section">'
+        "<h3>Identités distinctes trouvées sous ce nom</h3>"
+        f"{''.join(blocks)}</div>"
+    )
+
+
 async def generate_report_html(ai_profile: dict, profile: NameProfile) -> str:
     """Génère le HTML complet du rapport IA à injecter dans le panneau droit."""
     try:
@@ -294,6 +338,8 @@ async def generate_report_html(ai_profile: dict, profile: NameProfile) -> str:
         privacy = ai_profile.get("privacy_score", {}) or {}
         summary = ai_profile.get("summary", "")
         confidence = ai_profile.get("confidence_overall", "low")
+        namesakes = ai_profile.get("unverified_namesakes", []) or []
+        identity_clusters = ai_profile.get("identity_clusters", []) or []
 
         sections = [
             f'<div class="ai-summary">{_esc(summary)} {_confidence_badge(confidence)}</div>',
@@ -307,6 +353,8 @@ async def generate_report_html(ai_profile: dict, profile: NameProfile) -> str:
             _render_breaches(breaches),
             _render_digital_footprint(footprint),
             _render_privacy_score(privacy),
+            _render_identity_clusters(identity_clusters),
+            _render_namesakes(namesakes),
         ]
         return "\n".join(sections)
     except Exception as e:
