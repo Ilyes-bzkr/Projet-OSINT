@@ -307,7 +307,7 @@ function renderValidationCandidates(candidates) {
     const preChecked = c.confidence === "confirmed" || c.confidence === "corroborated";
     const emoji = PLATFORM_EMOJI[c.platform] || "🔗";
     const avatar = c.photo_url
-      ? `<img class="vc-avatar" src="${escapeHtml(c.photo_url)}" alt="" onerror="this.remove()">`
+      ? `<img class="vc-avatar" src="${escapeHtml(c.photo_url)}" alt="" title="Agrandir l'image" onerror="this.remove()">`
       : `<span class="vc-avatar vc-avatar-fallback">${emoji}</span>`;
     const card = document.createElement("div");
     card.className = "validation-card";
@@ -810,6 +810,14 @@ document.addEventListener("DOMContentLoaded", () => {
   $("validation-skip").addEventListener("click", () => sendValidation([]));
   $("validation-list").addEventListener("click", (e) => {
     if (e.target.closest("a") || e.target.classList.contains("vc-check")) return;
+    // P6 — clic sur un avatar (image réelle) : zoom plein écran pour juger le
+    // visage, sans cocher la carte. La décision reste humaine.
+    if (e.target.tagName === "IMG" && e.target.classList.contains("vc-avatar")) {
+      const card = e.target.closest(".validation-card");
+      const platform = card && card.querySelector(".vc-platform");
+      openLightbox(e.target.src, platform ? platform.textContent.trim() : "Photo");
+      return;
+    }
     const card = e.target.closest(".validation-card");
     if (!card) return;
     const check = card.querySelector(".vc-check");

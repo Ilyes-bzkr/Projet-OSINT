@@ -606,11 +606,18 @@ def _gate_web_documents(
 # métier ici : la sélection est seulement journalisée. Le ré-ancrage et la
 # relance ciblée viendront en Phase D. No-op total hors mode interactif.
 # ─────────────────────────────────────────────────────────────────────────────
+def _account_photo(raw: dict) -> Optional[str]:
+    """URL d'avatar d'un compte, toutes sources confondues (social : photo_url ;
+    GitHub : avatar_url). Sert de repère visuel à la validation humaine (P6)."""
+    return raw.get("photo_url") or raw.get("avatar_url") or None
+
+
 def _build_validation_candidates(results_l1: list[OsintResult]) -> dict:
     """Aperçu déterministe des comptes candidats à valider (social/github).
 
     Ne retient que les résultats porteurs d'un compte (username/login) : ce sont
-    les éléments désambiguïsants qu'un humain peut cocher. Pur, sans appel IA.
+    les éléments désambiguïsants qu'un humain peut cocher. Chaque candidat porte
+    son avatar (P6 — repère visuel). Pur, sans appel IA.
     """
     candidates = []
     for result in results_l1:
@@ -623,7 +630,7 @@ def _build_validation_candidates(results_l1: list[OsintResult]) -> dict:
             "platform": raw.get("platform") or result.module.value,
             "username": username,
             "url": result.url,
-            "photo_url": raw.get("photo_url"),
+            "photo_url": _account_photo(raw),
             "confidence": raw.get("confidence"),
             "cluster_id": raw.get("cluster_id"),
             "in_target_cluster": raw.get("in_target_cluster"),
@@ -728,6 +735,7 @@ def _apply_validation(
 
     confirmed_usernames: set = set()
     corroborated_usernames: set = set()
+    validated_photos: list = []
     auto_attached = 0
     for i, cluster in enumerate(clusters):
         cid = f"c{i}"
@@ -746,6 +754,11 @@ def _apply_validation(
                 raw["confidence"] = ConfidenceLevel.CONFIRMED.value
                 if uname:
                     confirmed_usernames.add(uname)
+                # P6 — l'avatar du compte confirmé devient une image à corroborer
+                # (reverse image + EXIF en couche 2). Décision finale = humaine.
+                photo = _account_photo(raw)
+                if photo and photo not in validated_photos:
+                    validated_photos.append(photo)
             else:
                 # Auto-rattaché à une ancre validée (signal FORT/MOYEN, P2).
                 if raw.get("confidence") == ConfidenceLevel.GUESSED.value:
@@ -761,10 +774,16 @@ def _apply_validation(
     identifiers["corroborated_social_usernames"] = sorted(
         set(identifiers.get("corroborated_social_usernames") or []) | corroborated_usernames
     )
+    # P6 — alimente la recherche d'image inversée de couche 2 avec les avatars
+    # confirmés, sans jamais retirer les photos déjà extraites par l'IA.
+    existing_photos = list(identifiers.get("photo_urls") or [])
+    identifiers["photo_urls"] = existing_photos + [
+        p for p in validated_photos if p not in existing_photos
+    ]
     logger.info(
         f"[validation] {len(validated_ids)} compte(s) validé(s) → ancres confirmées ; "
         f"{auto_attached} compte(s) auto-rattaché(s) ; grappe-cible = "
-        f"{len(target_members)} membre(s)"
+        f"{len(target_members)} membre(s) ; {len(validated_photos)} avatar(s) à corroborer"
     )
     return identifiers
 
