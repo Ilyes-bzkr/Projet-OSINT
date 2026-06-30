@@ -62,6 +62,10 @@
             </select>
           </div>
         </div>
+        <label class="interactive-toggle">
+          <input id="interactive-toggle" type="checkbox">
+          <span>Validation interactive — mettre la recherche en pause pour confirmer les bons comptes avant l'approfondissement</span>
+        </label>
       </div>
     </div>
 
@@ -144,6 +148,21 @@
   </header>
   <div class="details-panel-body" id="details-panel-body"></div>
 </aside>
+
+<!-- VALIDATION INTERACTIVE (mode interactif) -->
+<div id="validation-overlay" class="validation-overlay" aria-hidden="true">
+  <div class="validation-modal" role="dialog" aria-modal="true" aria-labelledby="validation-title">
+    <header class="validation-header">
+      <h3 id="validation-title">Confirmez les comptes de la bonne personne</h3>
+      <p class="validation-sub">Cochez les comptes qui appartiennent à la personne recherchée. Les comptes fortement liés à un compte coché seront rattachés automatiquement. Les autres restent visibles, sans être supprimés.</p>
+    </header>
+    <div id="validation-list" class="validation-list"></div>
+    <footer class="validation-footer">
+      <button id="validation-skip" class="btn-outline" type="button">Continuer sans valider</button>
+      <button id="validation-submit" class="btn-primary" type="button">Valider la sélection</button>
+    </footer>
+  </div>
+</div>
 
 <!-- LIGHTBOX PHOTO -->
 <div id="lightbox-overlay" class="lightbox-overlay" aria-hidden="true">

@@ -619,7 +619,7 @@ def _build_validation_candidates(results_l1: list[OsintResult]) -> dict:
         if not username:
             continue
         candidates.append({
-            "id": result.id,
+            "id": str(result.id),
             "platform": raw.get("platform") or result.module.value,
             "username": username,
             "url": result.url,
@@ -656,8 +656,117 @@ async def _interactive_checkpoint(
     if selection is None:
         logger.info("[checkpoint] aucune validation reçue (repli) — poursuite normale")
     else:
-        logger.info(f"[checkpoint] validation reçue (ignorée en Phase C) : {selection!r}")
+        logger.info(f"[checkpoint] validation reçue : {selection!r}")
     return selection
+
+
+def _parse_validation_selection(selection) -> set:
+    """Extrait l'ensemble des IDs de comptes validés depuis la réponse frontend.
+
+    Tolérant : accepte `{"selected": [...]}`, `{"ids": [...]}` ou une liste brute.
+    Tout le reste rend un ensemble vide (repli = aucune validation).
+    """
+    if selection is None:
+        return set()
+    if isinstance(selection, dict):
+        ids = selection.get("selected") or selection.get("ids") or []
+    elif isinstance(selection, (list, tuple, set)):
+        ids = list(selection)
+    else:
+        return set()
+    return {str(i) for i in ids if i}
+
+
+def _apply_validation(
+    selection,
+    results_l1: list[OsintResult],
+    identifiers: dict,
+    profile: NameProfile,
+) -> dict:
+    """Phase D — applique une validation humaine entre couche 1 et couche 2.
+
+    Les comptes COCHÉS deviennent des ancres CONFIRMÉES (signal le plus fort :
+    décision humaine). On re-clusterise strictement tous les comptes ; toute
+    grappe contenant un compte validé devient grappe-cible, ce qui RATTACHE
+    AUTOMATIQUEMENT les comptes fortement/moyennement liés (P2) sans les avoir
+    cochés. Les comptes hors-cible restent visibles (pool « non confirmé »,
+    jamais supprimés). Enfin, on augmente les identifiants pour que la couche 2
+    approfondisse l'identité confirmée (usernames confirmés + corroborés).
+
+    Mutation IN PLACE de raw_data (cluster_id / in_target_cluster / confidence) :
+    ces objets alimentent ensuite la couche 3 (profil IA). Rend les identifiants
+    augmentés ; rend `identifiers` inchangé si rien n'est validé.
+    """
+    validated_ids = _parse_validation_selection(selection)
+    if not validated_ids:
+        return identifiers
+
+    descriptors: list[dict] = []
+    by_id: dict[str, OsintResult] = {}
+    for result in results_l1:
+        raw = result.raw_data or {}
+        username = raw.get("username") or raw.get("login")
+        if not username:
+            continue
+        key = str(result.id)
+        descriptors.append({
+            "key": key, "username": username,
+            "content": evidence_engine.account_content_view(raw),
+            "first_name": profile.first_name, "last_name": profile.last_name,
+        })
+        by_id[key] = result
+
+    if not by_id:
+        return identifiers
+
+    clusters = evidence_engine.converge_accounts(descriptors, strict_edges=True)
+    target_members: set = set()
+    for cluster in clusters:
+        members = set(cluster["members"])
+        if validated_ids & members:
+            target_members |= members
+
+    confirmed_usernames: set = set()
+    corroborated_usernames: set = set()
+    auto_attached = 0
+    for i, cluster in enumerate(clusters):
+        cid = f"c{i}"
+        for key in cluster["members"]:
+            result = by_id.get(key)
+            if result is None:
+                continue
+            raw = result.raw_data
+            raw["cluster_id"] = cid
+            in_target = key in target_members
+            raw["in_target_cluster"] = in_target
+            if not in_target:
+                continue
+            uname = raw.get("username") or raw.get("login")
+            if key in validated_ids:
+                raw["confidence"] = ConfidenceLevel.CONFIRMED.value
+                if uname:
+                    confirmed_usernames.add(uname)
+            else:
+                # Auto-rattaché à une ancre validée (signal FORT/MOYEN, P2).
+                if raw.get("confidence") == ConfidenceLevel.GUESSED.value:
+                    raw["confidence"] = ConfidenceLevel.CORROBORATED.value
+                    auto_attached += 1
+                if uname:
+                    corroborated_usernames.add(uname)
+
+    identifiers = dict(identifiers)
+    identifiers["confirmed_social_usernames"] = sorted(
+        set(identifiers.get("confirmed_social_usernames") or []) | confirmed_usernames
+    )
+    identifiers["corroborated_social_usernames"] = sorted(
+        set(identifiers.get("corroborated_social_usernames") or []) | corroborated_usernames
+    )
+    logger.info(
+        f"[validation] {len(validated_ids)} compte(s) validé(s) → ancres confirmées ; "
+        f"{auto_attached} compte(s) auto-rattaché(s) ; grappe-cible = "
+        f"{len(target_members)} membre(s)"
+    )
+    return identifiers
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1274,12 +1383,16 @@ async def run_intelligence_engine(websocket, request: SearchRequest, search_id: 
         )
         await send_progress(websocket, search_id, "intelligence_engine", "running", "Couche 1 terminée", 40)
 
-        # Phase C — checkpoint interactif (no-op hors mode interactif). Isolé en
-        # try/except : une erreur de validation ne doit JAMAIS rompre le pipeline.
+        # Phases C+D — checkpoint interactif (no-op hors mode interactif). La
+        # validation humaine re-ancre l'identité-cible et augmente les
+        # identifiants AVANT la couche 2 (qui approfondit l'identité confirmée).
+        # Isolé en try/except : une erreur ne doit JAMAIS rompre le pipeline.
         try:
-            await _interactive_checkpoint(websocket, search_id, results_l1)
+            selection = await _interactive_checkpoint(websocket, search_id, results_l1)
+            if selection:
+                identifiers = _apply_validation(selection, results_l1, identifiers, profile)
         except Exception as e:
-            logger.warning(f"[checkpoint] ignoré sur erreur : {e}")
+            logger.warning(f"[checkpoint] validation ignorée sur erreur : {e}")
 
         await send_progress(websocket, search_id, "intelligence_engine", "running", "Couche 2 : approfondissement...", 45)
         results_l2 = await run_layer2(

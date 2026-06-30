@@ -57,6 +57,7 @@ const state = {
   screen: "home",
   searchName: "",
   anchors: {},
+  interactive: false,
   ws: null,
   manualClose: false,
   reconnectAttempts: 0,
@@ -188,7 +189,11 @@ function connectWebSocket() {
 
   ws.onopen = () => {
     state.reconnectAttempts = 0;
-    ws.send(JSON.stringify({ name: state.searchName, anchors: state.anchors || {} }));
+    ws.send(JSON.stringify({
+      name: state.searchName,
+      anchors: state.anchors || {},
+      interactive: !!state.interactive,
+    }));
   };
 
   ws.onmessage = (event) => {
@@ -234,6 +239,9 @@ function handleMessage(msg) {
     case "ai_profile":
       handleAiProfile(msg);
       break;
+    case "validation_request":
+      handleValidationRequest(msg);
+      break;
   }
 }
 
@@ -259,6 +267,86 @@ function handleProgress(msg) {
   const status = (msg.data && msg.data.status) || "running";
   updateModuleCard(moduleKey, status === "running" ? "running" : status === "completed" ? "completed" : status);
   updateGlobalProgress();
+}
+
+// === Validation interactive (mode interactif) ===
+// Le serveur émet "validation_request" au checkpoint (entre couche 1 et 2) et
+// SUSPEND la recherche jusqu'à notre "validation_response". On présente les
+// comptes candidats ; l'utilisateur coche ceux de la bonne personne.
+
+const VALIDATION_CONF = {
+  confirmed: { label: "Confirmé", cls: "conf-confirmed" },
+  corroborated: { label: "Corroboré", cls: "conf-corroborated" },
+  guessed: { label: "Incertain", cls: "conf-guessed" },
+};
+
+function handleValidationRequest(msg) {
+  const candidates = (msg.data && msg.data.candidates) || [];
+  renderValidationCandidates(candidates);
+  const overlay = $("validation-overlay");
+  overlay.classList.add("open");
+  overlay.setAttribute("aria-hidden", "false");
+}
+
+function renderValidationCandidates(candidates) {
+  const list = $("validation-list");
+  list.innerHTML = "";
+  if (!candidates.length) {
+    list.innerHTML = `<p class="validation-empty">Aucun compte à valider — vous pouvez continuer.</p>`;
+    return;
+  }
+  // Tri : comptes les plus fiables d'abord (confirmé, corroboré, puis incertain).
+  const order = { confirmed: 0, corroborated: 1, guessed: 2 };
+  const sorted = candidates.slice().sort(
+    (a, b) => (order[a.confidence] ?? 3) - (order[b.confidence] ?? 3)
+  );
+
+  sorted.forEach((c) => {
+    const conf = VALIDATION_CONF[c.confidence] || VALIDATION_CONF.guessed;
+    // Pré-coché pour les comptes déjà fiables ; à confirmer pour les incertains.
+    const preChecked = c.confidence === "confirmed" || c.confidence === "corroborated";
+    const emoji = PLATFORM_EMOJI[c.platform] || "🔗";
+    const avatar = c.photo_url
+      ? `<img class="vc-avatar" src="${escapeHtml(c.photo_url)}" alt="" onerror="this.remove()">`
+      : `<span class="vc-avatar vc-avatar-fallback">${emoji}</span>`;
+    const card = document.createElement("div");
+    card.className = "validation-card";
+    card.innerHTML = `
+      <input type="checkbox" class="vc-check" data-id="${escapeHtml(c.id)}" ${preChecked ? "checked" : ""}>
+      ${avatar}
+      <span class="vc-body">
+        <span class="vc-platform">${emoji} ${escapeHtml(c.platform || "")}</span>
+        <span class="vc-username">${escapeHtml(c.username || "")}</span>
+        ${c.url ? `<a class="vc-link" href="${escapeHtml(c.url)}" target="_blank" rel="noopener">Ouvrir ↗</a>` : ""}
+      </span>
+      <span class="vc-conf ${conf.cls}">${conf.label}</span>`;
+    list.appendChild(card);
+  });
+}
+
+function collectValidationSelection() {
+  const ids = [];
+  document.querySelectorAll("#validation-list .vc-check").forEach((el) => {
+    if (el.checked) ids.push(el.dataset.id);
+  });
+  return ids;
+}
+
+function closeValidationModal() {
+  const overlay = $("validation-overlay");
+  if (!overlay) return;
+  overlay.classList.remove("open");
+  overlay.setAttribute("aria-hidden", "true");
+}
+
+function sendValidation(ids) {
+  closeValidationModal();
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify({ type: "validation_response", data: { selected: ids } }));
+    showToast(ids.length
+      ? `${ids.length} compte(s) validé(s) — reprise de la recherche...`
+      : "Reprise de la recherche...");
+  }
 }
 
 // Détermine l'URL d'image et la SOURCE d'un résultat, toutes origines confondues.
@@ -675,6 +763,8 @@ function startSearch(name) {
   }
   state.searchName = trimmed;
   state.anchors = collectAnchors();
+  const interactiveEl = $("interactive-toggle");
+  state.interactive = !!(interactiveEl && interactiveEl.checked);
   state.totalResults = 0;
   state.moduleStatus = {};
   state.moduleCounts = {};
@@ -695,6 +785,7 @@ function newSearch() {
   }
   stopRotatingText();
   closeDetailsPanel();
+  closeValidationModal();
   $("search-input").value = "";
   showScreen("home");
 }
@@ -711,6 +802,19 @@ document.addEventListener("DOMContentLoaded", () => {
   $("details-close").addEventListener("click", closeDetailsPanel);
   $("details-overlay").addEventListener("click", closeDetailsPanel);
   $("new-search-btn").addEventListener("click", newSearch);
+
+  // Validation interactive : boutons + bascule de carte (un clic sur la carte
+  // coche/décoche, sauf sur le lien ou la case elle-même). Écouteurs stables :
+  // la liste est rebâtie en innerHTML mais le conteneur, lui, reste.
+  $("validation-submit").addEventListener("click", () => sendValidation(collectValidationSelection()));
+  $("validation-skip").addEventListener("click", () => sendValidation([]));
+  $("validation-list").addEventListener("click", (e) => {
+    if (e.target.closest("a") || e.target.classList.contains("vc-check")) return;
+    const card = e.target.closest(".validation-card");
+    if (!card) return;
+    const check = card.querySelector(".vc-check");
+    if (check) check.checked = !check.checked;
+  });
 
   // Lightbox photo : délégation sur la grille (rebâtie en streaming), donc un
   // seul écouteur stable suffit pour toutes les vignettes présentes et futures.
