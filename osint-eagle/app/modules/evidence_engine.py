@@ -317,6 +317,20 @@ def _is_nontrivial_name(name: Optional[str]) -> bool:
     return len(_norm(name)) >= 6 and len(tokens) >= 2
 
 
+def _is_query_name(name: Optional[str], first: str, last: str) -> bool:
+    """True si le nom affiché se RÉDUIT au prénom+nom recherché (rien de plus).
+
+    Ce nom-là est NON DISCRIMINANT : tous les homonymes de la recherche l'affichent,
+    donc il ne prouve rien sur l'appartenance à une même personne. À exclure des
+    signaux de corroboration/convergence (sinon les homonymes fusionnent)."""
+    fn, ln = _norm(first), _norm(last)
+    ref_tokens = {t for t in (fn, ln) if t}
+    if not ref_tokens:
+        return False
+    tokens = {_norm(t) for t in _loose(name).split() if _norm(t)}
+    return bool(tokens) and tokens <= ref_tokens
+
+
 def _bio_similar(a: Optional[str], b: Optional[str]) -> bool:
     """Bios quasi identiques : égalité normalisée OU fort recouvrement de tokens."""
     ta = {t for t in _loose(a).split() if t}
@@ -335,9 +349,15 @@ def _same_or_substring(a: str, b: str) -> bool:
 
 def _references(a: dict, b: dict) -> bool:
     """Vrai si le compte `a` pointe LITTÉRALEMENT vers `b` via ses liens sortants
-    (pseudo distinctif de `b` présent dans un lien de `a`)."""
+    (pseudo DISTINCTIF de `b` présent dans un lien de `a`).
+
+    Le pseudo doit être distinctif : un pseudo SIMPLE (= le nom décliné, ex.
+    « ilyesbouzekri ») recopié par un site miroir (imginn/picuki…) n'est pas une
+    preuve d'appartenance à une même personne — sinon les homonymes se lient."""
     handle = _norm(b.get("username"))
     if len(handle) < _MIN_XLINK_HANDLE:
+        return False
+    if classify_pseudo(b.get("username", ""), b.get("first_name", ""), b.get("last_name", "")) != "distinctive":
         return False
     links_blob = _norm(" ".join(a.get("content", {}).get("links") or []))
     return handle in links_blob
@@ -362,8 +382,11 @@ def _pair_signals(a: dict, b: dict) -> tuple[bool, set, list]:
     mediums: set = set()
     strong: list = []
 
+    # Nom complet identique ET plus spécifique que la requête : un nom qui se réduit
+    # au prénom+nom recherché n'est PAS un signal (tous les homonymes l'affichent).
     fa, fb = ca.get("fullname"), cb.get("fullname")
-    if fa and fb and _norm(fa) == _norm(fb) and _is_nontrivial_name(fa):
+    if (fa and fb and _norm(fa) == _norm(fb) and _is_nontrivial_name(fa)
+            and not _is_query_name(fa, a.get("first_name", ""), a.get("last_name", ""))):
         mediums.add("fullname")
     if la and lb and _same_or_substring(la, lb):
         mediums.add("location")

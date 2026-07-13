@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.core.logger import logger
 from app.models.result import ConfidenceLevel, OsintResult
 from app.models.search import NameProfile
+from app.modules.evidence_engine import account_content_view, loose_contains
 
 _MODEL = "claude-sonnet-4-6"
 # Le schéma de profil (11 sections) génère un JSON volumineux : 4000 tokens le
@@ -119,10 +120,30 @@ _PROFILE_SCHEMA = """{
   "unverified_namesakes": [
     {"platform": str, "username": str, "url": str ou null, "note": str}
   ],
+  "field_sources": {
+    "<section.champ>": "<url EXACTE recopiée d'une source fournie qui atteste ce champ>"
+  },
   "summary": str,
   "confidence_overall": "high"|"medium"|"low",
   "data_freshness": str
 }"""
+
+# Champs d'identité « déductibles » : le modèle ne doit les renseigner que si la
+# valeur est LITTÉRALEMENT présente dans une source fournie. Une passe de validation
+# en code (_enforce_sourced_fields) remet à null tout ce qui n'est pas attesté —
+# garantie anti-invention indépendante du modèle (mêmes principes que
+# account_enricher._validate_attrs). Format : {section: (champs scalaires,), (champs listes,)}.
+_SOURCED_SCALARS = {
+    "identity": ("age_estimated", "nationality"),
+    "location": ("current_city", "current_country", "timezone_estimated"),
+    "professional": ("current_employer", "current_school", "field", "job_title"),
+    "behavior": ("posting_hours_estimated", "writing_style"),
+}
+_SOURCED_LISTS = {
+    "identity": ("languages",),
+    "location": ("past_cities",),
+    "professional": ("past_employers",),
+}
 
 
 def _domain_of(url: str | None) -> str:
@@ -135,12 +156,23 @@ def _result_to_payload(result: OsintResult) -> dict:
     snippet = result.snippet or ""
     if len(snippet) > _SNIPPET_MAX_LEN:
         snippet = snippet[:_SNIPPET_MAX_LEN]
-    return {
+    payload = {
         "title": result.title,
         "domain": _domain_of(result.url),
+        # URL complète : sert de citation de source vérifiable par le modèle et
+        # par la passe de validation en code (field_sources).
+        "url": result.url,
         "snippet": snippet,
         "module": result.module.value,
     }
+    # Niveau de confiance d'appartenance (comptes confirmés / corroborés / devinés) :
+    # transmis pour que le modèle traite un compte prouvé comme un fait et un compte
+    # deviné avec prudence. Sans ce champ, tout le travail du moteur de preuves était
+    # perdu à l'étape de synthèse finale.
+    confidence = (result.raw_data or {}).get("confidence")
+    if confidence:
+        payload["confidence"] = confidence
+    return payload
 
 
 def _group_by_module(results: list[OsintResult]) -> dict[str, list[dict]]:
@@ -162,24 +194,35 @@ def _is_offtarget(result: OsintResult) -> bool:
     """True si le résultat n'appartient PAS à l'identité cible → exclu du profil
     principal (phase B, désambiguïsation par grappe).
 
-    Priorités :
-    - confirmed / corroborated : appartenance ÉTABLIE → toujours profil principal
-      (on ne bannit jamais un compte prouvé, même hors grappe-cible).
-    - in_target_cluster == True  → profil principal (grappe-cible, mode A).
-    - in_target_cluster == False → hors-cible (autre grappe d'homonyme, ou document
-      au nom seul non rattaché à une ancre — P5).
-    - tag absent (résultats dérivés couche 2, paste, breach, mode B) → règle
-      historique : guessed = hors-cible, sinon profil principal.
+    Priorités (la séparation de grappe l'emporte sur « corroborated ») :
+    - confirmed (match EXACT d'ancre : pseudo/email) → toujours profil principal.
+    - weak_mention → hors-cible (jamais un fait).
+    - in_target_cluster == False → hors-cible **même si corroborated** : une grappe
+      non-cible est un homonyme, et la corroboration par cohérence interne
+      (convergence) prouve « même personne entre eux », pas « c'est la cible ».
+    - in_target_cluster == True → profil principal (grappe-cible, mode A).
+    - tag absent (résultats dérivés couche 2, paste, breach, mode B) → corroboré =
+      profil principal ; guessed = hors-cible.
     """
     raw = result.raw_data or {}
-    if raw.get("confidence") in _TRUSTED_CONF:
+    confidence = raw.get("confidence")
+    # Match exact d'ancre : appartenance certaine, toujours profil principal.
+    if confidence == ConfidenceLevel.CONFIRMED.value:
         return False
+    # Mention faible (nom trouvé dans un fichier/classement, hit hors-sujet).
+    if raw.get("weak_mention"):
+        return True
+    # Grappe d'identité (mode A) : la non-appartenance à la grappe-cible prime sur
+    # « corroborated » — on isole les homonymes corroborés par cohérence interne.
     in_target = raw.get("in_target_cluster")
-    if in_target is True:
-        return False
     if in_target is False:
         return True
-    return raw.get("confidence") == ConfidenceLevel.GUESSED.value
+    if in_target is True:
+        return False
+    # Pas de tag de grappe : corroboré = principal, guessed = hors-cible.
+    if confidence == ConfidenceLevel.CORROBORATED.value:
+        return False
+    return confidence == ConfidenceLevel.GUESSED.value
 
 
 def _clusters_overview(results: list[OsintResult]) -> list[dict]:
@@ -224,6 +267,72 @@ def _namesake_payload(result: OsintResult) -> dict:
     }
 
 
+def _build_sources_text(results: list[OsintResult]) -> str:
+    """Corpus texte des sources RÉELLEMENT fournies au modèle (profil principal).
+
+    Sert de vérité pour la passe anti-invention : un attribut d'identité n'est
+    conservé que si sa valeur apparaît littéralement ici. On agrège titre, snippet,
+    et le contenu structuré des comptes (nom affiché, ville, métier, bio, liens…)
+    pour reconnaître aussi les attributs issus de comptes confirmés/corroborés.
+    """
+    parts: list[str] = []
+    for result in results:
+        parts.append(result.title or "")
+        parts.append(result.snippet or "")
+        raw = result.raw_data or {}
+        for value in account_content_view(raw).values():
+            if isinstance(value, str):
+                parts.append(value)
+            elif isinstance(value, list):
+                parts.extend(str(v) for v in value)
+    return " \n ".join(p for p in parts if p)
+
+
+def _enforce_sourced_fields(parsed: dict, sources_text: str) -> dict:
+    """Passe de validation DÉTERMINISTE anti-invention (Phase 1).
+
+    Remet à null tout champ d'identité déductible dont la valeur n'apparaît pas
+    littéralement dans les sources fournies, et filtre les listes de la même façon.
+    Garantie indépendante du modèle : même si l'IA invente « tunisien » ou « EPITA »,
+    ces valeurs disparaissent si aucune source ne les atteste. N'affecte PAS les
+    champs issus de modules déterministes (contact, fuites, empreinte, comptes).
+    """
+    if not isinstance(parsed, dict) or not sources_text:
+        return parsed
+
+    removed: list[str] = []
+
+    for section, keys in _SOURCED_SCALARS.items():
+        sec = parsed.get(section)
+        if not isinstance(sec, dict):
+            continue
+        for key in keys:
+            value = sec.get(key)
+            if isinstance(value, str) and value.strip() and not loose_contains(sources_text, value, min_len=2):
+                sec[key] = None
+                removed.append(f"{section}.{key}={value!r}")
+
+    for section, keys in _SOURCED_LISTS.items():
+        sec = parsed.get(section)
+        if not isinstance(sec, dict):
+            continue
+        for key in keys:
+            values = sec.get(key)
+            if not isinstance(values, list):
+                continue
+            kept = [v for v in values if isinstance(v, str) and loose_contains(sources_text, v, min_len=2)]
+            if len(kept) != len(values):
+                removed.append(f"{section}.{key} (-{len(values) - len(kept)})")
+            sec[key] = kept
+
+    if removed:
+        logger.info(
+            f"[AI] provenance : {len(removed)} attribut(s) d'identité non sourcé(s) "
+            f"neutralisé(s) : {removed}"
+        )
+    return parsed
+
+
 def _build_user_prompt(profile: NameProfile, results: list[OsintResult]) -> str:
     # Le profil principal ne se construit QUE sur la grappe-cible (mode A) / les
     # données confirmées-corroborées ; les comptes hors-cible (autres grappes
@@ -243,7 +352,17 @@ def _build_user_prompt(profile: NameProfile, results: list[OsintResult]) -> str:
         "professionnel, activités, réseau, etc.) UNIQUEMENT à partir des données "
         "confirmées/corroborées.\n"
         "- N'utilise JAMAIS les comptes non vérifiés comme des faits sur la cible : "
-        "recopie-les tels quels dans le champ 'unverified_namesakes' et nulle part ailleurs.\n\n"
+        "recopie-les tels quels dans le champ 'unverified_namesakes' et nulle part ailleurs.\n"
+        "- INTERDICTION D'INFÉRER : pour tout champ d'identité déductible "
+        "(nationalité, âge, ville/pays actuel, villes passées, langues, employeur, "
+        "école, métier, domaine, timezone, style d'écriture), ne mets une valeur que "
+        "si elle est ÉCRITE LITTÉRALEMENT dans une source fournie. Ne déduis JAMAIS "
+        "une nationalité/origine d'un nom, d'une langue ou d'un classement par pays. "
+        "Si ce n'est pas explicitement écrit, mets null (ou liste vide).\n"
+        "- Pour chacun de ces champs renseignés, ajoute une entrée dans 'field_sources' "
+        "avec la clé '<section>.<champ>' (ex: 'location.current_city') et l'URL EXACTE "
+        "de la source qui l'atteste (recopiée depuis le champ 'url' des données).\n"
+        "- Le champ 'summary' ne doit énoncer que des faits sourcés, sans spéculation.\n\n"
         f"Génère un JSON avec cette structure exacte :\n\n{_PROFILE_SCHEMA}"
     )
 
@@ -404,6 +523,10 @@ async def build_profile(
 
     selected = sorted(results, key=lambda r: r.relevance_score, reverse=True)[:_MAX_RESULTS]
 
+    # Corpus des sources du profil principal (hors homonymes) : vérité de la passe
+    # anti-invention appliquée après génération.
+    sources_text = _build_sources_text([r for r in selected if not _is_offtarget(r)])
+
     client = AsyncAnthropic(api_key=settings.anthropic_api_key, timeout=_TIMEOUT)
 
     for attempt in range(2):
@@ -427,6 +550,9 @@ async def build_profile(
             if parsed is not None:
                 if attempt == 0 and not raw_text.rstrip().endswith("}"):
                     logger.info("[AI] Profil récupéré après réparation d'une réponse tronquée")
+                # Garde-fou anti-invention : neutralise les attributs d'identité non
+                # attestés par une source avant toute mise en forme / affichage.
+                parsed = _enforce_sourced_fields(parsed, sources_text)
                 return _finalize_profile(parsed, results)
             # Échec malgré la réparation : on logge début ET fin pour confirmer
             # visuellement une troncature (le JSON commence bien mais finit coupé).

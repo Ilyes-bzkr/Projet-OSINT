@@ -398,6 +398,11 @@ async def _run_ai_pipeline(
         # résiduel ne doit subsister après le message "ai_profile".
         await _stop_heartbeat(heartbeat_task)
         logger.info("[AI] Envoi du profil au frontend")
+        # kept_ids : IDs des résultats jugés pertinents (>=0.5) par le filtrage IA.
+        # Le frontend s'en sert pour n'afficher dans le panneau de gauche que les
+        # documents pertinents (le bruit hors-sujet reste en base, jamais montré
+        # comme un fait). Précision maximale côté affichage brut aussi.
+        kept_ids = [str(r.id) for r in filtered]
         await send_message(websocket, WebSocketMessage(
             type="ai_profile",
             search_id=search_id,
@@ -408,6 +413,7 @@ async def _run_ai_pipeline(
                 "filtered_count": filtered_count,
                 "total_count": total_count,
                 "filter_rate": filter_rate,
+                "kept_ids": kept_ids,
             }
         ))
 

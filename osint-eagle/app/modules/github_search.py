@@ -206,7 +206,15 @@ async def _search_code(
                 title=f"Nom trouvé dans le code : {item.get('repository', {}).get('full_name')}",
                 url=item.get("html_url"),
                 snippet=item.get("path"),
-                raw_data={"repository": item.get("repository", {}).get("full_name"), "path": item.get("path")},
+                # weak_mention : simple présence du nom dans un fichier (ex. un
+                # classement "top-github-users-tunisia"). Ne prouve RIEN sur la
+                # cible → jamais traité comme un fait par le profileur (isolé en
+                # "à vérifier"). Évite la déduction "origine tunisienne".
+                raw_data={
+                    "repository": item.get("repository", {}).get("full_name"),
+                    "path": item.get("path"),
+                    "weak_mention": True,
+                },
                 risk_level=RiskLevel.MEDIUM,
             )
             results.append(result)

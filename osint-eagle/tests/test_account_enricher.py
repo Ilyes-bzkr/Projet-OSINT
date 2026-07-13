@@ -84,3 +84,33 @@ def test_validate_links_must_appear_literally():
 def test_validate_empty_when_nothing_valid():
     content, prov = ae._validate_attrs({"fullname": {"value": None, "source_url": None}}, [])
     assert content == {} and prov == {}
+
+
+# --- garde-fou anti-homonyme (Phase 4) --------------------------------------
+
+from app.modules.name_engine import generate_search_profile
+
+_PROFILE = generate_search_profile("Ilyes Bouzekri")
+
+
+def test_name_gate_rejects_homonym_snippet_for_simple_username():
+    # username SIMPLE (= nom) + snippet qui ne cite PAS le nom → homonyme probable, rejet.
+    snippets = [{"url": "http://s1", "text": "Compte basé à Berlin, photographe."}]
+    raw_attrs = {"location": {"value": "Berlin", "source_url": "http://s1"}}
+    content, _ = ae._validate_attrs(raw_attrs, snippets, _PROFILE, "ilyesbouzekri")
+    assert "location" not in content
+
+
+def test_name_gate_allows_when_name_present_for_simple_username():
+    snippets = [{"url": "http://s1", "text": "Ilyes Bouzekri, basé à Paris."}]
+    raw_attrs = {"location": {"value": "Paris", "source_url": "http://s1"}}
+    content, _ = ae._validate_attrs(raw_attrs, snippets, _PROFILE, "ilyesbouzekri")
+    assert content["location"] == "Paris"
+
+
+def test_distinctive_username_bypasses_name_gate():
+    # username DISTINCTIF (identifiant fiable) : snippet sans le nom accepté quand même.
+    snippets = [{"url": "http://s1", "text": "Profil @ily_bzk_dev, basé à Lyon."}]
+    raw_attrs = {"location": {"value": "Lyon", "source_url": "http://s1"}}
+    content, _ = ae._validate_attrs(raw_attrs, snippets, _PROFILE, "ily_bzk_dev")
+    assert content["location"] == "Lyon"

@@ -27,7 +27,7 @@ from app.core.config import settings
 from app.core.logger import logger
 from app.models.result import ConfidenceLevel, OsintResult
 from app.models.search import NameProfile
-from app.modules.evidence_engine import account_content_view, loose_contains
+from app.modules.evidence_engine import account_content_view, classify_pseudo, loose_contains
 from app.modules.web_search import _search_searxng
 
 __all__ = ["enrich_accounts"]
@@ -144,10 +144,38 @@ def _parse_extraction(raw_text: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _validate_attrs(raw_attrs: dict, snippets: list[dict]) -> tuple[dict, dict]:
+def _snippet_names_target(text: str, profile: Optional[NameProfile]) -> bool:
+    """True si le snippet co-mentionne le prénom ET le nom de la cible."""
+    if not profile:
+        return True
+    return (loose_contains(text, profile.first_name, min_len=2)
+            and loose_contains(text, profile.last_name, min_len=2))
+
+
+def _needs_name_gate(username: str, profile: Optional[NameProfile]) -> bool:
+    """Le garde-fou anti-homonyme (Phase 4) s'applique aux usernames SIMPLES
+    (dérivés du nom → nombreux homonymes). Un username DISTINCTIF est un identifiant
+    fiable en soi : ré-chercher ce handle ramène très probablement la même personne,
+    on n'exige donc pas la co-mention du nom."""
+    if not profile or not profile.last_name:
+        return False
+    return classify_pseudo(username, profile.first_name, profile.last_name) != "distinctive"
+
+
+def _validate_attrs(
+    raw_attrs: dict,
+    snippets: list[dict],
+    profile: Optional[NameProfile] = None,
+    username: str = "",
+) -> tuple[dict, dict]:
     """Filtre les attributs extraits par PROVENANCE (garde-fou anti-invention) :
     un attribut n'est retenu que si sa source_url est l'une des URLs fournies ET que
     sa valeur apparaît littéralement dans le snippet cité. Sinon rejeté.
+
+    Garde-fou anti-homonyme (Phase 4) : si `profile` est fourni et que `username`
+    est SIMPLE (dérivé du nom), un attribut n'est retenu que si son snippet
+    co-mentionne le nom de la cible — sinon c'est probablement un homonyme et on
+    rejette (on n'attache jamais un attribut d'homonyme au compte cible).
 
     Retourne (content, provenance) — content au format raw_data["content"].
     """
@@ -157,6 +185,8 @@ def _validate_attrs(raw_attrs: dict, snippets: list[dict]) -> tuple[dict, dict]:
 
     if not isinstance(raw_attrs, dict):
         return content, provenance
+
+    name_gate = _needs_name_gate(username, profile)
 
     for field in _SCALAR_FIELDS:
         entry = raw_attrs.get(field)
@@ -171,6 +201,8 @@ def _validate_attrs(raw_attrs: dict, snippets: list[dict]) -> tuple[dict, dict]:
             continue  # provenance absente / inventée
         if not loose_contains(text, value, min_len=2):
             continue  # la valeur n'apparaît pas littéralement → rejet
+        if name_gate and not _snippet_names_target(text, profile):
+            continue  # snippet ne parle pas de la cible → homonyme probable, rejet
         content[field] = value.strip()
         provenance[field] = source
 
@@ -185,6 +217,8 @@ def _validate_attrs(raw_attrs: dict, snippets: list[dict]) -> tuple[dict, dict]:
         text = url_to_text.get(source)
         if not text or value.lower() not in text.lower():
             continue  # lien non présent littéralement → rejet (jamais d'inférence)
+        if name_gate and not _snippet_names_target(text, profile):
+            continue  # lien issu d'un snippet d'homonyme probable → rejet
         clean = value.strip()
         links.append(clean)
         provenance[f"link:{clean}"] = source
@@ -274,7 +308,9 @@ async def enrich_accounts(results: list[OsintResult], profile: NameProfile) -> N
         for username, accounts in by_username.items():
             if username not in usable:
                 continue
-            content, provenance = _validate_attrs(extracted.get(username) or {}, usable[username])
+            content, provenance = _validate_attrs(
+                extracted.get(username) or {}, usable[username], profile, username
+            )
             if not content:
                 continue
             enriched_users += 1

@@ -15,14 +15,25 @@ def _cluster_of(clusters, key):
 # --- PALIER FORT ------------------------------------------------------------
 
 def test_strong_cross_link_promotes():
+    # Lien croisé vers un pseudo DISTINCTIF (identifiant fiable) → FORT → promu.
     clusters = converge_accounts([
-        _acc("a", "ilyesbouzekri", links=["https://soundcloud.com/ilyes-bouzekri"]),
-        _acc("b", "ilyes-bouzekri"),
+        _acc("a", "ilyesbouzekri", links=["https://soundcloud.com/ilyzkr93"]),
+        _acc("b", "ilyzkr93"),
     ])
     c = _cluster_of(clusters, "a")
     assert c["promoted"] is True
     assert {"a", "b"} == set(c["members"])
     assert any("FORT: lien croisé" in s for s in c["signals"])
+
+
+def test_simple_pseudo_cross_link_is_not_strong():
+    # Lien croisé vers un pseudo SIMPLE (nom décliné, typique d'un site miroir
+    # imginn/picuki) → PAS une preuve d'appartenance → non promu.
+    clusters = converge_accounts([
+        _acc("a", "ilyesbouzekri", links=["https://imginn.com/ilyes-bouzekri"]),
+        _acc("b", "ilyes-bouzekri"),
+    ])
+    assert _cluster_of(clusters, "a")["promoted"] is False
 
 
 def test_strong_shared_email_promotes():
@@ -35,15 +46,38 @@ def test_strong_shared_email_promotes():
 
 # --- DEUX PALIERS MOYENS ----------------------------------------------------
 
-def test_two_mediums_name_and_city_promote():
+def test_two_mediums_location_and_occupation_promote():
+    # Deux signaux MOYENS RÉELS (localisation + occupation) → promu. Le nom = requête
+    # n'est délibérément PAS compté (non discriminant : tous les homonymes l'ont).
+    clusters = converge_accounts([
+        _acc("a", "ilyesbouzekri", location="Paris", occupation="Ingénieur"),
+        _acc("b", "ilyes-bouzekri", location="Paris", occupation="Ingénieur"),
+    ])
+    c = _cluster_of(clusters, "a")
+    assert c["promoted"] is True
+    assert any("MOYEN: location" in s for s in c["signals"])
+    assert any("MOYEN: occupation" in s for s in c["signals"])
+
+
+def test_query_name_plus_city_is_not_enough():
+    # Deux homonymes ne partageant que le NOM RECHERCHÉ + une ville → 1 seul moyen
+    # réel (location) → NON promu (le nom = requête ne compte pas).
     clusters = converge_accounts([
         _acc("a", "ilyesbouzekri", fullname="Ilyes Bouzekri", location="Paris"),
         _acc("b", "ilyes-bouzekri", fullname="Ilyes Bouzekri", location="Paris"),
     ])
+    assert _cluster_of(clusters, "a")["promoted"] is False
+
+
+def test_specific_fullname_still_counts_as_medium():
+    # Un nom PLUS spécifique que la requête (prénom composé) reste un signal MOYEN.
+    clusters = converge_accounts([
+        _acc("a", "ilyesbouzekri", fullname="Ilyes Karim Bouzekri", location="Paris"),
+        _acc("b", "ilyes-bouzekri", fullname="Ilyes Karim Bouzekri", location="Paris"),
+    ])
     c = _cluster_of(clusters, "a")
     assert c["promoted"] is True
     assert any("MOYEN: fullname" in s for s in c["signals"])
-    assert any("MOYEN: location" in s for s in c["signals"])
 
 
 def test_single_medium_name_only_stays_guessed():
@@ -104,10 +138,11 @@ def test_convergence_never_returns_confirmed():
 
 
 def test_compatible_city_substring_is_a_match_not_divergence():
-    # "Paris" vs "Paris, France" → concordance (pas divergence) → 2 moyens → promu.
+    # "Paris" vs "Paris, France" → concordance (pas divergence). Avec un 2e moyen
+    # réel (occupation), le cluster est promu.
     clusters = converge_accounts([
-        _acc("a", "ilyesbouzekri", fullname="Ilyes Bouzekri", location="Paris"),
-        _acc("b", "ilyes-bouzekri", fullname="Ilyes Bouzekri", location="Paris, France"),
+        _acc("a", "ilyesbouzekri", location="Paris", occupation="Dev"),
+        _acc("b", "ilyes-bouzekri", location="Paris, France", occupation="Dev"),
     ])
     assert _cluster_of(clusters, "a")["promoted"] is True
 
@@ -130,9 +165,10 @@ def test_strict_edges_name_only_does_not_merge():
 
 
 def test_strict_edges_two_mediums_still_merge():
+    # Deux moyens RÉELS (localisation + occupation) → arête stricte → fusion.
     clusters = converge_accounts([
-        _acc("a", "ilyesbouzekri", fullname="Ilyes Bouzekri", location="Paris"),
-        _acc("b", "ilyes-bouzekri", fullname="Ilyes Bouzekri", location="Paris"),
+        _acc("a", "ilyesbouzekri", location="Paris", occupation="Dev"),
+        _acc("b", "ilyes-bouzekri", location="Paris", occupation="Dev"),
     ], strict_edges=True)
     assert _cluster_of(clusters, "a") is _cluster_of(clusters, "b")
 

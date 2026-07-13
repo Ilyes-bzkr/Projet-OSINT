@@ -37,8 +37,15 @@ def test_confirmed_always_main_even_outside_target():
     assert profiler._is_offtarget(_acc(confidence="confirmed", in_target=False)) is False
 
 
-def test_corroborated_always_main_even_outside_target():
-    assert profiler._is_offtarget(_acc(confidence="corroborated", in_target=False)) is False
+def test_corroborated_outside_target_cluster_is_offtarget():
+    # FIX : une grappe non-cible l'emporte sur « corroborated ». Un compte corroboré
+    # par cohérence interne mais hors grappe-cible est un homonyme → isolé.
+    assert profiler._is_offtarget(_acc(confidence="corroborated", in_target=False)) is True
+
+
+def test_corroborated_without_cluster_tag_stays_main():
+    # Sans tag de grappe (résultat dérivé couche 2 / mode B), corroboré = principal.
+    assert profiler._is_offtarget(_acc(confidence="corroborated")) is False
 
 
 def test_untagged_guessed_stays_offtarget():
@@ -100,3 +107,43 @@ def test_doc_name_plus_employer_linked():
 
 def test_doc_anchor_url_linked():
     assert ie._doc_anchor_linked(_doc(url="https://github.com/ilybzk2"), _ANCHORS, _REF, _PROFILE) is True
+
+
+# --- Phase 2 : mentions faibles + gating en mode B (sans ancre) --------------
+
+def test_weak_mention_is_offtarget():
+    # GitHub search/code : nom trouvé dans un fichier de classement → jamais un fait.
+    doc = _doc(title="Nom trouvé dans le code : awesome/top-github-users-tunisia")
+    doc.raw_data["weak_mention"] = True
+    assert profiler._is_offtarget(doc) is True
+
+
+def test_doc_mode_b_name_only_not_linked():
+    # Sans ancre et sans identifiant établi, le nom seul ne rattache pas (précision max).
+    empty_ref = ConfirmedReference()
+    assert ie._doc_anchor_linked(_doc(title="Ilyes Bouzekri", snippet="acteur"),
+                                 None, empty_ref, _PROFILE) is False
+
+
+def test_doc_mode_b_corroborated_distinctive_username_linked():
+    # Mode B : un document citant le pseudo distinctif d'un compte corroboré est rattaché.
+    empty_ref = ConfirmedReference()
+    assert ie._doc_anchor_linked(_doc(snippet="voir le profil ily_bzk_dev"),
+                                 None, empty_ref, _PROFILE,
+                                 extra_usernames={"ily_bzk_dev"}) is True
+
+
+def test_doc_mode_b_confirmed_reference_username_linked():
+    # Mode B : un username confirmé (GitHub) distinctif dans la référence rattache aussi.
+    ref = ConfirmedReference(usernames={"ily_bzk_dev"})
+    assert ie._doc_anchor_linked(_doc(snippet="repo de ily_bzk_dev"),
+                                 None, ref, _PROFILE) is True
+
+
+def test_gate_web_documents_tags_in_target_cluster():
+    linked = _doc(snippet="contact ilyes@mail.com")
+    unlinked = _doc(title="Ilyes Bouzekri", snippet="film 2014")
+    ref = ConfirmedReference(emails={"ilyes@mail.com"})
+    ie._gate_web_documents([linked, unlinked], None, ref, _PROFILE)
+    assert linked.raw_data["in_target_cluster"] is True
+    assert unlinked.raw_data["in_target_cluster"] is False

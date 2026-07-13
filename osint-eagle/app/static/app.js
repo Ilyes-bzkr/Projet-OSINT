@@ -57,7 +57,10 @@ const state = {
   screen: "home",
   searchName: "",
   anchors: {},
-  interactive: false,
+  // Précision maximale : validation interactive activée par défaut (l'humain
+  // confirme les bons comptes avant l'approfondissement). Reflète l'état coché
+  // par défaut du toggle ; la valeur réelle est relue à chaque lancement.
+  interactive: true,
   ws: null,
   manualClose: false,
   reconnectAttempts: 0,
@@ -69,6 +72,10 @@ const state = {
   totalResults: 0,
   aiRiskScore: null,
   aiProfile: null,
+  // IDs des résultats jugés pertinents par le filtrage IA (envoyés avec le profil).
+  // Sert à n'afficher dans le panneau de gauche que les documents pertinents. Null
+  // tant que le profil IA n'est pas arrivé (ou IA désactivée) → aucun filtrage.
+  keptIds: null,
   // URLs d'images dont le chargement a échoué : filtrées au rendu pour ne jamais
   // réafficher une vignette cassée (les avatars de comptes peuvent expirer / être
   // protégés). Réinitialisé à chaque nouvelle recherche.
@@ -207,6 +214,14 @@ function connectWebSocket() {
 
   ws.onclose = () => {
     if (state.manualClose) return;
+    // Si la modale de validation était ouverte, la connexion perdue signifie que
+    // le serveur a replié le checkpoint (poursuite sans validation) : on ferme la
+    // modale morte et on prévient plutôt que de laisser l'utilisateur bloqué.
+    const overlay = $("validation-overlay");
+    if (overlay && overlay.classList.contains("open")) {
+      closeValidationModal();
+      showToast("Connexion interrompue pendant la validation — la recherche a continué sans elle.");
+    }
     if (state.screen === "searching" && state.reconnectAttempts < 3) {
       state.reconnectAttempts += 1;
       showToast("Connexion perdue, nouvelle tentative...");
@@ -254,6 +269,7 @@ function handleStarted(msg) {
   $("total-counter").textContent = "0 résultats trouvés";
   state.aiRiskScore = null;
   state.aiProfile = null;
+  state.keptIds = null;
   $("ai-placeholder").hidden = false;
   $("ai-report").hidden = true;
   $("ai-report").innerHTML = "";
@@ -382,6 +398,9 @@ function collectPhotoFromResult(result) {
   const photo = extractPhoto(result);
   if (!photo || !photo.url) return;
   if (state.results.photos.some((p) => p.url === photo.url)) return;
+  // On garde l'id du résultat source pour pouvoir filtrer par kept_ids (ne pas
+  // afficher l'avatar d'un compte hors-cible comme photo de la cible).
+  photo.id = result.id;
   state.results.photos.push(photo);
   renderPhotos();
 }
@@ -454,6 +473,14 @@ function handleAiProfile(msg) {
   const data = msg.data || {};
   state.aiRiskScore = typeof data.risk_score === "number" ? data.risk_score : state.aiRiskScore;
   state.aiProfile = data.profile || null;
+  state.keptIds = Array.isArray(data.kept_ids) ? new Set(data.kept_ids.map(String)) : null;
+  // Le profil IA arrive avant le message "complete" qui déclenche le rendu du
+  // panneau de gauche : re-render immédiat si l'écran résultats est déjà affiché.
+  if (state.screen === "results") {
+    renderPhotos();
+    renderDocuments();
+    renderVideos();
+  }
 
   const placeholder = $("ai-placeholder");
   const report = $("ai-report");
@@ -509,8 +536,9 @@ function renderResultsScreen() {
 
 function renderPhotos() {
   const grid = $("photos-grid");
-  // On exclut les images déjà signalées cassées pour ne pas les réafficher.
-  const photos = state.results.photos.filter((p) => !state.brokenPhotos.has(p.url));
+  // On exclut les images cassées, puis on ne garde que les photos pertinentes
+  // (kept_ids) : un avatar de compte hors-cible n'est pas une photo de la cible.
+  const photos = filterKept(state.results.photos).filter((p) => !state.brokenPhotos.has(p.url));
   if (photos.length === 0) {
     grid.innerHTML = `<div class="empty-state">👤 Aucune photo trouvée</div>`;
     return;
@@ -527,13 +555,21 @@ function renderPhotos() {
     .join("");
 }
 
+// Ne conserve que les résultats jugés pertinents par le filtrage IA (kept_ids).
+// Tant que le profil IA n'est pas arrivé (keptIds null), on n'écarte rien.
+function filterKept(items) {
+  if (!state.keptIds) return items;
+  return items.filter((r) => r && r.id != null && state.keptIds.has(String(r.id)));
+}
+
 function renderDocuments() {
   const list = $("documents-list");
-  if (state.results.documents.length === 0) {
+  const documents = filterKept(state.results.documents);
+  if (documents.length === 0) {
     list.innerHTML = `<li class="empty-state">📄 Aucun document trouvé</li>`;
     return;
   }
-  list.innerHTML = state.results.documents
+  list.innerHTML = documents
     .map((d) => {
       const date = d.found_at ? new Date(d.found_at).toLocaleDateString("fr-FR") : "";
       return `
@@ -551,11 +587,12 @@ function renderDocuments() {
 
 function renderVideos() {
   const list = $("videos-list");
-  if (state.results.videos.length === 0) {
+  const videos = filterKept(state.results.videos);
+  if (videos.length === 0) {
     list.innerHTML = `<li class="empty-state">▶️ Aucune vidéo trouvée</li>`;
     return;
   }
-  list.innerHTML = state.results.videos
+  list.innerHTML = videos
     .map(
       (v) => `
       <li>
@@ -765,6 +802,16 @@ function startSearch(name) {
   state.anchors = collectAnchors();
   const interactiveEl = $("interactive-toggle");
   state.interactive = !!(interactiveEl && interactiveEl.checked);
+
+  // Rappel non-bloquant : sans repère fiable, la précision plafonne sur un nom
+  // courant (homonymes). On lance quand même — la validation interactive prend
+  // le relais si elle est active.
+  const hasAnchor = Object.values(state.anchors || {}).some((v) => v);
+  if (!hasAnchor) {
+    showToast(state.interactive
+      ? "Aucune ancre : la validation interactive vous aidera à confirmer les bons comptes. Une ancre (email, pseudo, ville) affinerait encore."
+      : "Sans ancre ni validation, la précision est limitée sur un nom courant. Ajoutez une ancre ou activez la validation interactive.");
+  }
   state.totalResults = 0;
   state.moduleStatus = {};
   state.moduleCounts = {};

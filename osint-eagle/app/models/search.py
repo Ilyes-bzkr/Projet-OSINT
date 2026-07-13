@@ -92,11 +92,13 @@ class SearchRequest(BaseModel):
     enable_dark_web: bool = Field(default=False, description="Activer la recherche dark web")
     anchors: SearchAnchors = Field(default_factory=SearchAnchors, description="Ancres de vérité optionnelles")
     interactive: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Active le checkpoint de validation interactif entre couche 1 et "
-            "couche 2 (pause/reprise WebSocket). Défaut False : comportement "
-            "non-interactif identique, de bout en bout sans pause."
+            "couche 2 (pause/reprise WebSocket). Défaut True (précision maximale) : "
+            "l'humain confirme les comptes de la bonne personne avant "
+            "l'approfondissement, ce qui élimine les homonymes en amont. Le "
+            "frontend peut le désactiver explicitement (interactive=False)."
         ),
     )
 

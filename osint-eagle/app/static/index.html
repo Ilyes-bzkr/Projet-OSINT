@@ -28,10 +28,10 @@
     <div class="scoping stagger" style="--delay:3">
       <button id="scoping-toggle" class="scoping-toggle" type="button" aria-expanded="false" aria-controls="scoping-fields">
         <span class="scoping-icon">+</span>
-        <span>Affiner la recherche (optionnel)</span>
+        <span>Affiner la recherche — fortement recommandé pour une précision maximale</span>
       </button>
       <div id="scoping-fields" class="scoping-fields" hidden>
-        <p class="scoping-hint">Ces informations améliorent la précision des résultats. Laissez vide ce que vous ignorez.</p>
+        <p class="scoping-hint">Renseignez au moins <strong>une</strong> ancre (email, pseudo ou ville) : sans repère fiable, un nom seul ne suffit pas à distinguer la bonne personne de ses homonymes. Laissez vide ce que vous ignorez.</p>
         <div class="scoping-grid">
           <div class="scoping-field">
             <label for="anchor-city">Ville / région</label>
@@ -63,8 +63,8 @@
           </div>
         </div>
         <label class="interactive-toggle">
-          <input id="interactive-toggle" type="checkbox">
-          <span>Validation interactive — mettre la recherche en pause pour confirmer les bons comptes avant l'approfondissement</span>
+          <input id="interactive-toggle" type="checkbox" checked>
+          <span>Validation interactive <strong>(recommandé)</strong> — mettre la recherche en pause pour confirmer les bons comptes avant l'approfondissement. Élimine les homonymes.</span>
         </label>
       </div>
     </div>

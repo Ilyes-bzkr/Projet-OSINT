@@ -45,6 +45,11 @@ _LAYER1_SOCIAL_VARIANTS = 5
 _LAYER2_MAX_SOCIAL_USERNAMES = 2
 _LAYER2_SOCIAL_TOP_SITES = 50
 _VIDEO_FRAME_COUNT = 3
+# Plafonds durs couche 2 : la recherche d'image inversée (Yandex/Lens via navigateur)
+# est l'étape la plus coûteuse/lente. On borne le nombre de photos/vidéos
+# approfondies pour maîtriser coût et latence (les avatars confirmés d'abord).
+_LAYER2_MAX_IMAGES = 3
+_LAYER2_MAX_VIDEOS = 2
 
 # Concurrence Bing maximale pour TOUS les dorks web d'une recherche, partagée
 # via un unique sémaphore (miroir de web_search._MAX_CONCURRENT_DORKS) afin de
@@ -335,11 +340,31 @@ def _classify_social_accounts(
     return corroborated
 
 
+def _member_in_target(
+    key: str,
+    social_by_key: dict[str, OsintResult],
+    github_results: list[OsintResult],
+) -> bool:
+    """True si le compte identifié par `key` est dans la grappe-cible (tag
+    in_target_cluster posé par _assign_identity_clusters, qui doit tourner AVANT)."""
+    if key.startswith("s"):
+        result = social_by_key.get(key)
+        return bool(result and (result.raw_data or {}).get("in_target_cluster") is True)
+    if key.startswith("g"):
+        login = key[1:]
+        for result in github_results:
+            raw = result.raw_data or {}
+            if raw.get("login") == login and raw.get("in_target_cluster") is True:
+                return True
+    return False
+
+
 def _run_convergence(
     social_results: list[OsintResult],
     github_results: list[OsintResult],
     github_login_confidence: dict[str, str],
     profile: NameProfile,
+    require_target_link: bool = False,
 ) -> set[str]:
     """Convergence inter-comptes (Piste A) : promeut des clusters de comptes guessed
     cohérents en corroborated. Réécrit raw_data["confidence"] des comptes promus et
@@ -347,6 +372,12 @@ def _run_convergence(
 
     GitHub guessed participe comme les autres (jamais promu du seul fait d'être
     GitHub — il suit les mêmes règles). Aucune promotion en confirmed.
+
+    `require_target_link` (mode A, ancre présente) : un cluster COHÉRENT n'est promu
+    que s'il est rattaché à la cible (au moins un membre dans la grappe-cible). La
+    cohérence interne prouve « même personne entre eux », JAMAIS « c'est la cible » :
+    sans ce garde-fou, une grappe d'homonymes se promeut elle-même et envahit le
+    profil. Suppose que _assign_identity_clusters a déjà tourné.
     """
     guessed = ConfidenceLevel.GUESSED.value
     descriptors: list[dict] = []
@@ -394,6 +425,16 @@ def _run_convergence(
             f"[convergence] cluster {members} | signaux : {cluster['signals'] or ['aucun']} | {decision}"
         )
         if not cluster["promoted"]:
+            continue
+        # Mode A : un cluster cohérent mais non rattaché à la cible est un homonyme
+        # → jamais promu (il restera guessed et sera isolé en « à vérifier »).
+        if require_target_link and not any(
+            _member_in_target(key, social_by_key, github_results) for key in members
+        ):
+            logger.info(
+                f"[convergence] cluster {members} cohérent mais NON rattaché à l'ancre "
+                "(mode A) → laissé guessed (homonyme isolé)"
+            )
             continue
         for key in members:
             if key.startswith("s"):
@@ -532,20 +573,29 @@ def _assign_identity_clusters(
 
 def _doc_anchor_linked(
     result: OsintResult,
-    anchors: SearchAnchors,
+    anchors: Optional[SearchAnchors],
     reference: evidence_engine.ConfirmedReference,
     profile: NameProfile,
+    extra_usernames: Optional[set[str]] = None,
 ) -> bool:
-    """P5 — un document/web est rattaché à la cible s'il référence une ancre :
-    pseudo distinctif / email / URL d'ancre (FORT), ou nom complet + employeur/ville
-    d'ancre (MOYEN). Le nom seul ne suffit JAMAIS."""
+    """P5 — un document/web est rattaché à la cible s'il référence un identifiant
+    ÉTABLI : pseudo distinctif (ancre, GitHub confirmé, ou compte corroboré), email
+    ou URL confirmés (FORT), ou nom complet + employeur/ville d'ancre (MOYEN). Le nom
+    seul ne suffit JAMAIS. Fonctionne aussi sans ancre (mode B) : on recoupe alors
+    contre les identifiants prouvés durant la recherche."""
     text = " ".join(p for p in (result.title, result.snippet, result.url) if p).lower()
     if not text:
         return False
     norm_text = evidence_engine.norm(text)
 
-    if anchors.username:
-        handle = anchors.username.lstrip("@")
+    # Handles distinctifs établis : ancre pseudo + usernames confirmés (reference)
+    # + usernames corroborés passés par l'orchestrateur.
+    handles: set[str] = set(reference.usernames)
+    if anchors is not None and anchors.username:
+        handles.add(anchors.username.lstrip("@"))
+    if extra_usernames:
+        handles.update(extra_usernames)
+    for handle in handles:
         nh = evidence_engine.norm(handle)
         if (len(nh) >= 4
                 and evidence_engine.classify_pseudo(handle, profile.first_name, profile.last_name) == "distinctive"
@@ -562,13 +612,14 @@ def _doc_anchor_linked(
         if len(token) >= 4 and token in text:
             return True
 
-    name_present = (evidence_engine.loose_contains(text, profile.first_name, 2)
-                    and evidence_engine.loose_contains(text, profile.last_name, 2))
-    if name_present:
-        if anchors.employer and evidence_engine.loose_contains(text, anchors.employer, 3):
-            return True
-        if anchors.city and evidence_engine.loose_contains(text, anchors.city, 3):
-            return True
+    if anchors is not None:
+        name_present = (evidence_engine.loose_contains(text, profile.first_name, 2)
+                        and evidence_engine.loose_contains(text, profile.last_name, 2))
+        if name_present:
+            if anchors.employer and evidence_engine.loose_contains(text, anchors.employer, 3):
+                return True
+            if anchors.city and evidence_engine.loose_contains(text, anchors.city, 3):
+                return True
 
     return False
 
@@ -578,23 +629,26 @@ def _gate_web_documents(
     anchors: Optional[SearchAnchors],
     reference: evidence_engine.ConfirmedReference,
     profile: NameProfile,
+    extra_usernames: Optional[set[str]] = None,
 ) -> None:
     """P5 — tag additif des résultats web/documents : in_target_cluster=True s'ils
-    sont rattachés à une ancre, False sinon (= écartés du profil principal en aval).
+    recoupent un identifiant établi, False sinon (= écartés du profil principal,
+    routés en « à vérifier »).
 
-    Mode B (aucune ancre) : pas de gating documentaire (rien à quoi rattacher).
+    Précision maximale : actif AUSSI en mode B (sans ancre). Sans identifiant établi
+    (ni ancre, ni GitHub confirmé, ni compte corroboré), un document au nom seul ne
+    prouve pas l'appartenance → écarté du profil principal (jamais supprimé : il
+    reste visible dans le flux brut).
     """
-    if anchors is None or anchors.is_empty():
-        return
     linked = 0
     for result in web_results:
-        is_linked = _doc_anchor_linked(result, anchors, reference, profile)
+        is_linked = _doc_anchor_linked(result, anchors, reference, profile, extra_usernames)
         result.raw_data = result.raw_data or {}
         result.raw_data["in_target_cluster"] = is_linked
         linked += int(is_linked)
     logger.info(
-        f"[documents] {linked}/{len(web_results)} document(s) rattaché(s) à une ancre ; "
-        f"{len(web_results) - linked} écarté(s) (nom seul)"
+        f"[documents] {linked}/{len(web_results)} document(s) rattaché(s) à un identifiant établi ; "
+        f"{len(web_results) - linked} écarté(s) (nom seul → à vérifier)"
     )
 
 
@@ -788,122 +842,6 @@ def _apply_validation(
     return identifiers
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DIAGNOSTIC TEMPORAIRE [DIAG-ATTR] — mesure la richesse RÉELLE des attributs des
-# comptes évalués en couche 1A (combien portent fullname/ville/bio/occupation/
-# email/lien, combien ont un content vide = platform+username+url seulement).
-# But : chiffrer l'ampleur de l'enrichissement à construire avant la convergence
-# inter-comptes (Piste A). N'altère AUCUNE décision : pure observation.
-# À RETIRER une fois les chiffres lus (le helper + son appel dans run_layer1).
-# ─────────────────────────────────────────────────────────────────────────────
-def _diag_attr_view(result: OsintResult, source: str) -> dict:
-    """Vue normalisée des attributs d'un compte, quelle que soit sa source
-    (GitHub a ses champs à plat ; Maigret les expose sous raw_data['content'])."""
-    raw = result.raw_data or {}
-    if source == "GitHub":
-        return {
-            "platform": "GitHub",
-            "username": raw.get("login") or "?",
-            "fullname": raw.get("name"),
-            "ville": raw.get("location"),
-            "bio": raw.get("bio"),
-            "occupation": raw.get("company"),
-            "email": raw.get("email"),
-            "links": [raw["blog"]] if raw.get("blog") else [],
-            "avatar": raw.get("avatar_url"),
-        }
-    content = raw.get("content") or {}
-    return {
-        "platform": raw.get("platform") or "?",
-        "username": raw.get("username") or "?",
-        "fullname": content.get("fullname"),
-        "ville": content.get("location"),
-        "bio": content.get("bio"),
-        "occupation": content.get("occupation"),
-        "email": content.get("email"),
-        "links": content.get("links") or [],
-        "avatar": raw.get("photo_url"),
-    }
-
-
-def _diag_log_account_attributes(
-    social_results: list[OsintResult],
-    github_results: list[OsintResult],
-) -> None:
-    """Logge une ligne [DIAG-ATTR] par compte évalué puis une synthèse chiffrée.
-
-    DIAGNOSTIC TEMPORAIRE : observe la présence des attributs, ne modifie rien.
-    """
-    def _on(value) -> str:
-        return "oui" if value else "non"
-
-    views: list[tuple[str, dict]] = []
-
-    # GitHub : on ne compte que les profils RÉELLEMENT évalués par
-    # _classify_github_results (entrées "profil" portant un avatar, dédupliquées
-    # par login) — pas les entrées email/commit qui partagent le même login.
-    seen_logins: set = set()
-    for result in github_results:
-        raw = result.raw_data or {}
-        login = raw.get("login")
-        if not login or not raw.get("avatar_url") or login in seen_logins:
-            continue
-        seen_logins.add(login)
-        views.append(("GitHub", _diag_attr_view(result, "GitHub")))
-
-    for result in social_results:
-        views.append(("Maigret", _diag_attr_view(result, "Maigret")))
-
-    counts = {"fullname": 0, "ville": 0, "bio": 0, "occupation": 0, "email": 0, "links": 0, "avatar": 0}
-    with_attr = 0
-    n_maigret = 0
-    n_github = 0
-
-    for source, a in views:
-        if source == "GitHub":
-            n_github += 1
-        else:
-            n_maigret += 1
-
-        content_present = any([a["fullname"], a["ville"], a["bio"], a["occupation"], a["email"], a["links"]])
-        if content_present:
-            with_attr += 1
-        for key in ("fullname", "ville", "bio", "occupation", "email", "avatar"):
-            if a[key]:
-                counts[key] += 1
-        if len(a["links"]) >= 1:
-            counts["links"] += 1
-
-        logger.info(
-            f"[DIAG-ATTR] {a['platform']} @{a['username']} | "
-            f"fullname={_on(a['fullname'])} ville={_on(a['ville'])} bio={_on(a['bio'])} "
-            f"occupation/employer={_on(a['occupation'])} email={_on(a['email'])} "
-            f"liens_croisés={len(a['links'])} avatar={_on(a['avatar'])} | "
-            f"content_vide={_on(not content_present)}"
-        )
-
-    total = len(views)
-    logger.info("[DIAG-ATTR] === SYNTHÈSE ===")
-    logger.info(f"[DIAG-ATTR] Total comptes évalués : {total}")
-    logger.info(
-        "[DIAG-ATTR] Avec au moins un attribut exploitable "
-        f"(fullname|ville|bio|occupation|email|lien) : {with_attr} / {total}"
-    )
-    logger.info(
-        "[DIAG-ATTR] content totalement vide (platform+username+url seulement) : "
-        f"{total - with_attr} / {total}"
-    )
-    logger.info(
-        f"[DIAG-ATTR] Détail par attribut : fullname={counts['fullname']}, "
-        f"ville={counts['ville']}, bio={counts['bio']}, occupation={counts['occupation']}, "
-        f"email={counts['email']}, liens_croisés≥1={counts['links']}, avatar={counts['avatar']}"
-    )
-    logger.info(
-        f"[DIAG-ATTR] Répartition des sources : Maigret={n_maigret} comptes, "
-        f"GitHub={n_github} profils"
-    )
-
-
 def _clean_json_text(raw_text: str) -> str:
     text = raw_text.strip()
     if text.startswith("```"):
@@ -976,6 +914,22 @@ def _extract_platform_domain(result: OsintResult) -> Optional[str]:
     return netloc or None
 
 
+def _layer1_usernames(profile: NameProfile, anchors: Optional[SearchAnchors]) -> list[str]:
+    """Usernames scannés par Maigret en couche 1A.
+
+    Le pseudo d'ancre est mis EN PREMIER : sans lui, seules les variantes dérivées
+    du nom sont scannées, donc les vrais comptes de la cible (souvent sous un pseudo
+    distinctif, ex. « ilyes_bzkr ») n'apparaissent qu'en couche 2 — trop tard pour
+    ancrer le clustering et pour être proposés à la validation interactive. Les
+    homonymes dérivés du nom dominaient alors le profil.
+    """
+    usernames: list[str] = []
+    if anchors is not None and anchors.username:
+        usernames.append(anchors.username.lstrip("@"))
+    usernames += profile.username_variants[:_LAYER1_SOCIAL_VARIANTS]
+    return usernames
+
+
 async def run_layer1(
     profile: NameProfile,
     search_id: str,
@@ -1005,7 +959,10 @@ async def run_layer1(
     # puis on les diffuse étiquetés. github/paste continuent de streamer en direct.
     social_results, github_results, paste_results = await asyncio.gather(
         _safe_run(
-            check_all_platforms(profile, search_id, _noop_callback, max_variants=_LAYER1_SOCIAL_VARIANTS),
+            check_all_platforms(
+                profile, search_id, _noop_callback,
+                usernames=_layer1_usernames(profile, anchors),
+            ),
             "social",
         ),
         _safe_run(search_github(profile, search_id, callback), "github"),
@@ -1063,34 +1020,37 @@ async def run_layer1(
     # (confirmed / corroborated / guessed). C'est ici que l'enrichissement porte.
     corroborated_usernames = _classify_social_accounts(social_results, reference)
 
-    # DIAGNOSTIC TEMPORAIRE [DIAG-ATTR] : mesure la richesse des attributs APRÈS
-    # enrichissement (à retirer une fois les chiffres lus). N'altère aucune décision ;
-    # isolé en try/except pour ne jamais casser le pipeline.
-    try:
-        _diag_log_account_attributes(social_results, github_results)
-    except Exception as e:
-        logger.warning(f"[DIAG-ATTR] échec du diagnostic d'attributs : {e}")
-
-    # ★ Convergence inter-comptes : promeut des clusters de guessed mutuellement
-    # cohérents en corroborated (jamais confirmed). Alimente le profil principal via
-    # le routage corroborated EXISTANT. Isolée : un échec ne casse pas le pipeline.
-    try:
-        promoted = _run_convergence(social_results, github_results, github_login_confidence, profile)
-        corroborated_usernames |= promoted
-    except Exception as e:
-        logger.warning(f"[convergence] échec (ignoré) : {e}")
-
     # ★ Phase A — grappes d'identité : tag additif cluster_id / in_target_cluster
-    # (désambiguïsation homonymes). Aucune décision de routage ici (phase B).
+    # (désambiguïsation homonymes). Doit tourner AVANT la convergence pour que
+    # celle-ci puisse vérifier le rattachement à la grappe-cible (mode A).
     try:
         _assign_identity_clusters(social_results, github_results, profile, anchors, reference)
     except Exception as e:
         logger.warning(f"[clusters] échec (ignoré) : {e}")
 
-    # ★ Phase B — gating documentaire (P5) : un document/web n'entre dans le profil
-    # cible que s'il est rattaché à une ancre (sinon écarté du profil principal).
+    # ★ Convergence inter-comptes : promeut des clusters de guessed mutuellement
+    # cohérents en corroborated (jamais confirmed). En mode A (ancre présente), un
+    # cluster n'est promu QUE s'il est rattaché à la grappe-cible : la cohérence
+    # interne ne prouve pas l'appartenance à la cible (sinon les homonymes se
+    # promeuvent eux-mêmes). Isolée : un échec ne casse pas le pipeline.
+    anchored = anchors is not None and not anchors.is_empty()
     try:
-        _gate_web_documents(web_results + anchored_dork_results, anchors, reference, profile)
+        promoted = _run_convergence(
+            social_results, github_results, github_login_confidence, profile,
+            require_target_link=anchored,
+        )
+        corroborated_usernames |= promoted
+    except Exception as e:
+        logger.warning(f"[convergence] échec (ignoré) : {e}")
+
+    # ★ Phase B — gating documentaire (P5) : un document/web n'entre dans le profil
+    # cible que s'il recoupe un identifiant établi (ancre, GitHub confirmé, ou
+    # username corroboré) ; sinon écarté du profil principal. Actif aussi sans ancre.
+    try:
+        _gate_web_documents(
+            web_results + anchored_dork_results, anchors, reference, profile,
+            extra_usernames=corroborated_usernames,
+        )
     except Exception as e:
         logger.warning(f"[documents] gating échoué (ignoré) : {e}")
 
@@ -1225,8 +1185,8 @@ async def run_layer2(
 
     emails = list(identifiers.get("emails") or [])
     phones = identifiers.get("phone_numbers") or []
-    photos = identifiers.get("photo_urls") or []
-    videos = identifiers.get("video_urls") or []
+    photos = (identifiers.get("photo_urls") or [])[:_LAYER2_MAX_IMAGES]
+    videos = (identifiers.get("video_urls") or [])[:_LAYER2_MAX_VIDEOS]
 
     # Usernames sociaux FIABLES uniquement (classés en couche 1) : confirmés
     # (GitHub / ancre) et corroborés par preuve. Les comptes "guessed" (homonymes

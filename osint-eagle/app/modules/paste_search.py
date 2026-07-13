@@ -7,12 +7,12 @@ import asyncio
 from typing import Callable
 
 import httpx
-from duckduckgo_search import DDGS
 
 from app.core.config import settings
 from app.core.logger import logger
 from app.models.result import ModuleType, OsintResult, ResultCategory, RiskLevel
 from app.models.search import NameProfile
+from app.modules.web_search import _search_searxng
 
 __all__ = ["search_pastes"]
 
@@ -22,11 +22,7 @@ _TIMEOUT = 8.0
 
 _PASTE_SITES = ["pastebin.com", "paste.ee", "ghostbin.com", "controlc.com"]
 _MAX_RESULTS_PER_DORK = 5
-
-
-def _run_dork_sync(query: str, max_results: int) -> list[dict]:
-    with DDGS() as ddgs:
-        return list(ddgs.text(query, max_results=max_results))
+_DORK_TIMEOUT = 15.0
 
 
 async def _search_psbdmp(profile: NameProfile, search_id: str, callback: Callable, results: list):
@@ -65,14 +61,14 @@ async def _search_psbdmp(profile: NameProfile, search_id: str, callback: Callabl
 
 
 async def _search_paste_dorks(profile: NameProfile, search_id: str, callback: Callable, results: list):
-    loop = asyncio.get_event_loop()
-
+    # Dorks paste routés vers SearXNG (API JSON locale), comme web_search : évite le
+    # rate-limiting de DuckDuckGo qui faisait échouer ce module de façon récurrente.
     for site in _PASTE_SITES:
         query = f'site:{site} "{profile.full_name}"'
         try:
             raw_results = await asyncio.wait_for(
-                loop.run_in_executor(None, _run_dork_sync, query, _MAX_RESULTS_PER_DORK),
-                timeout=10,
+                _search_searxng(query, _MAX_RESULTS_PER_DORK),
+                timeout=_DORK_TIMEOUT,
             )
         except asyncio.TimeoutError:
             logger.warning(f"paste_search : timeout sur le dork '{query}'")
@@ -82,7 +78,7 @@ async def _search_paste_dorks(profile: NameProfile, search_id: str, callback: Ca
             raw_results = []
 
         for item in raw_results:
-            url = item.get("href") or item.get("url")
+            url = item.get("href")
             if not url:
                 continue
 
@@ -93,7 +89,7 @@ async def _search_paste_dorks(profile: NameProfile, search_id: str, callback: Ca
                 title=item.get("title") or url,
                 url=url,
                 snippet=(item.get("body") or "")[:500],
-                raw_data={"source": "ddg_dork", "dork": query},
+                raw_data={"source": "searxng_dork", "dork": query},
                 risk_level=RiskLevel.HIGH,
                 is_sensitive=True,
             )
@@ -104,7 +100,7 @@ async def _search_paste_dorks(profile: NameProfile, search_id: str, callback: Ca
 
 
 async def search_pastes(profile: NameProfile, search_id: str, callback: Callable) -> list[OsintResult]:
-    """Cherche le nom sur les sites de paste publics (psbdmp.ws + dorks DuckDuckGo)."""
+    """Cherche le nom sur les sites de paste publics (psbdmp.ws + dorks SearXNG)."""
     results: list[OsintResult] = []
 
     await _search_psbdmp(profile, search_id, callback, results)
